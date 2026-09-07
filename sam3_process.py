@@ -922,7 +922,11 @@ def handle_delete_frames(args):
 
 
 def handle_quality_metrics(args):
-    """Handle --quality-metrics: compute and save quality_metrics.npz for the project."""
+    """Compute and save quality_metrics.npz for the project.
+
+    Runs by default after detection / --refine / --redo / --reset;
+    suppressed by --no-quality-metrics.
+    """
     project = _load_project(args.project)
     if project is None:
         return 1
@@ -1257,9 +1261,6 @@ def handle_export_sam2(args):
     n = len(new_mapping)
     print(f"sam2_handoff.json written: {n} SAM2 object(s) → {handoff_path}")
     print(f"Open in sam2_ui.py: File → Import Masks → {args.project}")
-
-    if getattr(args, "quality_metrics", False):
-        return handle_quality_metrics(args)
     return 0
 
 
@@ -2039,8 +2040,8 @@ def handle_status(args):
             print(f"\n  [OPTIONAL] Export to SAM2 handoff for use in sam2_ui.py:")
             print(f"    {script} {proj_arg} --export-sam2")
         if not os.path.exists(metrics):
-            print(f"\n  [OPTIONAL] Compute quality metrics:")
-            print(f"    {script} {proj_arg} --quality-metrics")
+            print(f"\n  [OPTIONAL] (Re)compute quality metrics:")
+            print(f"    {script} {proj_arg}")
 
     if lock_info:
         elapsed = int(_time_mod.time() - lock_info.get("started", _time_mod.time()))
@@ -2231,11 +2232,12 @@ def main():
                              "(exact match).  Unmatched instances are resolved interactively: "
                              "assign new ID, merge into an existing ID, or discard.  Without this "
                              "flag, all new instances are auto-assigned fresh IDs.")
-    parser.add_argument("--quality-metrics", action="store_true", dest="quality_metrics",
-                        help="Compute inter-frame-change / background-ratio / overlap-ratio "
-                             "metrics for all masks in the project and save quality_metrics.npz "
-                             "to the project directory.  Can be combined with --refine or "
-                             "--export-sam2 to compute metrics after those operations finish.")
+    parser.add_argument("--no-quality-metrics", action="store_true", dest="no_quality_metrics",
+                        help="Skip the quality-metrics computation that otherwise runs by "
+                             "default after detection / --refine / --redo / --reset.  By "
+                             "default those operations compute inter-frame-change / "
+                             "background-ratio / overlap-ratio metrics for all masks in the "
+                             "project and save quality_metrics.npz to the project directory.")
     parser.add_argument("--status", action="store_true",
                         help="Print a summary of the project: concepts, instances, pending "
                              "refinements/re-detection, available CUDA devices, and suggested "
@@ -2282,31 +2284,33 @@ def main():
         return export_project(args)
 
     if args.export_sam2:
-        rc = handle_export_sam2(args)
-        if rc == 0 and args.quality_metrics:
-            return handle_quality_metrics(args)
-        return rc
+        # No quality-metrics recompute here: --export-sam2 only writes sam2_handoff.json
+        # and never changes SAM3 masks, so quality_metrics.npz from detection/refine
+        # still applies.
+        return handle_export_sam2(args)
+
+    want_quality = not args.no_quality_metrics
 
     if args.redo is not None:
         rc = redo_project(args)
-        if rc == 0 and args.quality_metrics:
+        if rc == 0 and want_quality:
             return handle_quality_metrics(args)
         return rc
 
     if args.reset is not None:
         rc = reset_project(args)
-        if rc == 0 and args.quality_metrics:
+        if rc == 0 and want_quality:
             return handle_quality_metrics(args)
         return rc
 
     if args.refine is not None:
         rc = refine_project(args)
-        if rc == 0 and args.quality_metrics:
+        if rc == 0 and want_quality:
             return handle_quality_metrics(args)
         return rc
 
     rc = process_project(args)
-    if rc == 0 and args.quality_metrics:
+    if rc == 0 and want_quality:
         return handle_quality_metrics(args)
     return rc
 
