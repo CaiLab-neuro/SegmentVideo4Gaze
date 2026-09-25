@@ -45,12 +45,20 @@ def _atomic_json_dump(data, path: str, indent: int = 2) -> None:
     (OOM-killer, Ctrl-C, power loss) leaves truncated JSON and the next
     json.load raises — for project.json that makes the whole project
     unopenable. os.replace is atomic on the same filesystem.
+
+    tempfile.mkstemp() always creates its file mode 0600 (owner-only),
+    ignoring the process umask by design. os.replace() preserves that mode,
+    so without the explicit chmod below every file written through here
+    would end up unreadable/unwritable by the rest of the group even when
+    the caller has set a group-friendly umask (e.g. 0o002) for everything
+    else.
     """
     dir_name = os.path.dirname(path) or "."
     fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
     try:
         with os.fdopen(fd, 'w') as f:
             json.dump(data, f, indent=indent)
+        os.chmod(tmp_path, 0o664)
         os.replace(tmp_path, path)
     except BaseException:
         try:
