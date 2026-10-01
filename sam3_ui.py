@@ -61,7 +61,7 @@ from sam3_pipeline import (
     compute_continuous_periods, online_replay_concept_refinements,
     replay_concept_refinements, ensure_bf16_autocast,
 )
-from sam3_utils import DynamicFrameCompositor, generate_concept_color, validate_text_prompt, export_to_sam2_format, load_sam3_mask
+from sam3_utils import DynamicFrameCompositor, generate_concept_color, validate_text_prompt, export_to_sam2_format, load_sam3_mask, retire_deleted_handoff_ids
 
 
 # ── App-level settings (persisted across sessions, independent of any project) ─
@@ -7017,6 +7017,7 @@ class ExportSAM2Dialog:
         self.existing_handoff: dict = {}
         self.existing_mapping: dict = {}
         self.existing_covered: dict = {}
+        self.existing_retired: dict = {}  # handoff "retired_ids": deleted instances' ids
         self.reverse_lookup: dict = {}  # (concept_name, sam3_obj_id) → sam2_id
 
         self._load_existing_handoff()
@@ -7048,7 +7049,10 @@ class ExportSAM2Dialog:
                 pass
         self.existing_mapping = self.existing_handoff.get("object_mapping", {})
         self.existing_covered = self.existing_handoff.get("sam2_covered_ids", {})
-        for sam2_id_str, entry in self.existing_mapping.items():
+        self.existing_retired = self.existing_handoff.get("retired_ids", {})
+        # Retired entries first so a live mapping wins; a restored instance gets its old id back.
+        for sam2_id_str, entry in (list(self.existing_retired.items())
+                                   + list(self.existing_mapping.items())):
             key = (entry.get("concept"), entry.get("instance_id"))
             self.reverse_lookup[key] = int(sam2_id_str)
 
@@ -7181,8 +7185,8 @@ class ExportSAM2Dialog:
         inner.bind("<Configure>",
                    lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
 
-        # Compute ID assignments
-        reserved: set = {int(k) for k in self.existing_mapping}
+        # Compute ID assignments (retired ids stay reserved, never proposed for new rows)
+        reserved: set = {int(k) for k in self.existing_mapping} | {int(k) for k in self.existing_retired}
         if self.csv_name_map:
             reserved.update(e["id"] for e in self.csv_name_map.values())
         next_id = self._next_free_id(reserved)
@@ -7355,7 +7359,8 @@ class ExportSAM2Dialog:
         new_covered: dict = dict(self.existing_covered)
 
         # --- Compute reserved IDs and next_free helper ---
-        reserved: set = {int(k) for k in new_mapping}
+        # Retired ids (deleted SAM3 instances) stay reserved so they are never reused.
+        reserved: set = {int(k) for k in new_mapping} | {int(k) for k in self.existing_retired}
         if self.csv_name_map:
             reserved.update(e["id"] for e in self.csv_name_map.values())
         next_id = self._next_free_id(reserved)
@@ -7408,6 +7413,11 @@ class ExportSAM2Dialog:
                 if not state["inc_var"].get():
                     continue
                 sam2_id = state["id_var"].get()
+                if str(sam2_id) in self.existing_retired:
+                    errors.append(
+                        f"Instance '{inst.user_name}': ID {sam2_id} is reserved - it belonged to "
+                        f"a deleted SAM3 instance. Choose a different ID.")
+                    continue
                 color = list(inst.get_effective_color(concept.color_rgb or (200, 200, 200)))
 
             sub_entry = {
@@ -7461,6 +7471,13 @@ class ExportSAM2Dialog:
                 }
             new_colors[str(sam2_id)] = info["color"]
 
+        # Retire ids of instances deleted since the last export (and trim deleted parts
+        # out of unions); otherwise sam2_ui.py / sam2_process.py keep using them.
+        new_mapping, new_retired, retire_messages = retire_deleted_handoff_ids(
+            project, new_mapping, self.existing_retired, new_covered)
+        for message in retire_messages:
+            print(message)
+
         if not new_mapping:
             messagebox.showwarning("Warning", "No instances selected for export.")
             return
@@ -7493,6 +7510,7 @@ class ExportSAM2Dialog:
             "object_mapping": new_mapping,
             "object_colors": new_colors,
             "sam2_covered_ids": new_covered,
+            "retired_ids": new_retired,
             "sam2_results_subdir": "sam2_results",
         }
 
@@ -7511,7 +7529,10 @@ class ExportSAM2Dialog:
         n_covered = len(new_covered)
         msg = (f"sam2_handoff.json written.\n\n"
                f"{n} SAM2 object(s) assigned.\n"
-               + (f"{n_covered} object(s) marked as covered by SAM3.\n\n" if n_covered else "\n")
+               + (f"{n_covered} object(s) marked as covered by SAM3.\n" if n_covered else "")
+               + (f"{len(retire_messages)} change(s) for deleted instances (see console).\n"
+                  if retire_messages else "")
+               + "\n"
                + f"Open in sam2_ui.py: File → Import Masks → {project.project_dir}")
         messagebox.showinfo("Export Complete", msg)
 

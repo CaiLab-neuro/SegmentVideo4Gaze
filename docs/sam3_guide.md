@@ -217,7 +217,7 @@ Each entry may also include a new field `max_instances` to cap how many instance
 | `--device cuda:0` | GPU selection; a device string or comma-separated list (`cuda:0,cuda:1`) or `all` for multi-GPU |
 | `--parallel N` | Concurrent worker processes (workers are spread over `--device` GPUs; each loads its own model, ~8 GB GPU memory) |
 | `--frame-dir DIR` | Persistent directory for extracted frames (reused on later runs on the same project) |
-| `--mask-format png\|npz` | Mask storage format for new projects (`npz` appears slightly faster) |
+| `--mask-format png\|npz` | Mask storage format for new projects (`npz` appears slightly faster). NPZ masks also store the mask's bounding box under the key `bbox` (`[x_min, y_min, x_max, y_max]`, pixels, inclusive; `-1`s if empty) |
 | `--sam-version 3\|3.1` | `3.1` uses the Object Multiplex checkpoint — faster with many instances across multiple GPUs(requires Hopper grade GPU, untested) |
 | `--cache-size N` | Decoded frames kept in RAM during propagation (default 50) |
 | `--max-cond-frames N` | Bound GPU memory/compute when a concept has many correction frames (e.g., 4–8) |
@@ -250,6 +250,8 @@ python sam3_process.py --project my_project --export-sam2 \
 ```
 
 This writes `sam2_handoff.json` in the project directory. Opening it from `sam2_ui.py` marks the SAM3-covered objects as **covered**: their masks come from the SAM3 project (no re-segmentation, no click points needed), and you annotate only the remaining objects with points. Masks are referenced in place — nothing is copied. Running `--export-sam2` again after further SAM3 work adds new instances without changing existing ID assignments.
+
+**Changing SAM3 objects after the handoff.** Objects that came from SAM3 stay owned by the SAM3 project: refine or delete them in `sam3_ui.py` / `sam3_process.py`, not in `sam2_ui.py` (which shows them read-only), then re-run `--export-sam2` and `sam2_process.py`. On re-export, the SAM2 id of a deleted instance moves to `retired_ids` in `sam2_handoff.json`: it disappears from `sam2_ui.py`, `sam2_process.py` removes its old masks from `sam2_results/masks/` (the SAM3 originals are untouched), and the id stays reserved so it is never given to another object. If you undo the deletion in SAM3, the next export restores the same id. A union of several instances loses only its deleted parts. Use `sam2_ui.py` only for new objects SAM3 did not cover.
 
 With `--sam2-object-list` (a CSV exported from `sam2_ui.py` via "Export Object List"), SAM3 instances are matched to existing SAM2 object IDs by name; unmatched instances are resolved interactively. The same export is available in the UI as **Export SAM2 Format...**.
 

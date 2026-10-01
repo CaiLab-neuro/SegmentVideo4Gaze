@@ -146,7 +146,7 @@ These outputs feed directly into the [gaze-target alignment step](gaze_alignment
 
 ## Working with SAM3 Results (Handoff)
 
-If you segmented some objects with the [SAM3 pipeline](sam3_guide.md) first, export them with `sam3_process.py --export-sam2` and load the resulting `sam2_handoff.json` in `sam2_ui.py`. The SAM3-covered objects appear in the object list as **covered**: they need no click points and are skipped during segmentation — their masks are taken from the SAM3 project (as the union of the referenced SAM3 instance masks) at export time. You only annotate the objects SAM3 could not detect.
+If you segmented some objects with the [SAM3 pipeline](sam3_guide.md) first, export them with `sam3_process.py --export-sam2` and load the resulting `sam2_handoff.json` in `sam2_ui.py`. The SAM3-covered objects appear in the object list as **covered**: they need no click points and are skipped during segmentation — their masks are taken from the SAM3 project (as the union of the referenced SAM3 instance masks) at export time. You only annotate the objects SAM3 could not detect. To change or delete a SAM3-derived object, do it in the SAM3 project and re-export (see [Changing SAM3 objects after the handoff](sam3_guide.md#exporting-to-the-sam2-pipeline)); ids of deleted SAM3 instances stay reserved and cannot be annotated here.
 
 ## Point-Based Prompts with SAM3 Models
 

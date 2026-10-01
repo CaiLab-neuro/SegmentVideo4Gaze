@@ -112,21 +112,26 @@ python process_gaze_mask_alignment.py \
 | `--ignore-object-list` | Text file with object labels to ignore, one per line (`#` comments allowed). SAM2: names, IDs, or mask filenames; SAM3: `concept_name`, `user_name`, or `concept_user_name` |
 | `--gaze-radius` | Radius (pixels) of the disk around each gaze point used for mask-overlap confidence (default 20). Larger = more tolerant of tracking noise, but blurs nearby objects |
 | `--gaze-confidence-threshold` | Minimum overlap confidence to assign a gazed object (default 0.5). The raw confidence is always recorded unthresholded |
+| `--pipeline` | Which masks to score for a SAM3 project that was handed off to SAM2: `auto` (default; SAM3 if the mask dir has `project.json`, else SAM2), `sam3` (SAM3 instances only), `sam2` (`sam2_results/masks/` only), `both` (SAM3 instances plus objects added natively in SAM2; SAM3-derived, covered and retired SAM2 ids are skipped to avoid double counting). In `both`, use `gazed_object` (the name) to identify objects: SAM3 and SAM2 ids are separate number ranges, so a `gazed_object_id` such as `id5` alone is ambiguous |
 | `--num-workers` | Number of subject-camera pairs processed in parallel (default 1) |
-| `--within-job-workers` | Parallel workers for mask I/O within one pair (default 1; higher may saturate disk) |
-| `--recompute` | Force recomputation from masks even if a cached probabilities `.pkl` exists |
+| `--within-job-workers` | Worker processes scoring frames within one pair (default 4; 1 = sequential). Automatically reduced so that `--num-workers` x this value does not exceed the available CPUs. Results are identical for any value |
+| `--recompute` | Force recomputation from masks even if a cached probabilities `.pkl` exists. Without it, the cache is reused only if radius, pipeline, ignore list, mask source, gaze and world CSVs and blink setting match those recorded next to it; otherwise it is recomputed automatically |
 | `--skip-figures` | Skip trajectory and confidence heatmap figures |
+| `--vector-figures` | Keep the per-sample trajectory and heatmap as vector graphics in the PDFs. By default they are rasterized at 300 dpi inside the PDF (axes and text stay vector), which keeps PDFs small and fast for long recordings |
 | `--category-sort` | Row ordering in figures: `first_seen` (default) or `frequency` |
 | `--start-plot-time` / `--end-plot-time` | Time window (seconds) for method-figure plots |
 | `--log-path` | Path for the log file (default: `{output_dir}/gaze_object.log`) |
 
 ## Output Files
 
-- **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gazed_object.csv`** — gaze samples with assigned object labels and confidence
-- **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gaze_object_probabilities.pkl`** — per-gaze probabilities for all available masks (also serves as a cache for re-runs)
-- **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gaze_blink_labeled.csv`** — blink-labeled gaze data when `--blink-dir` is used
-- **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gaze_blink_removed.csv`** — blink-removed gaze data when `--blink-dir` is used
-- **`output_dir/{subject_id}_gazed_object/figures/`** — trajectory plots and confidence heatmaps (PNG and PDF)
+- **`output_dir/{subject_id}/{camera}/{subject_id}_{camera}_gazed_object.csv`** — gaze samples with assigned object labels and confidence
+- **`output_dir/{subject_id}/{camera}/{subject_id}_{camera}_gaze_object_probabilities.pkl`** — per-gaze probabilities for all available masks (also serves as a cache for re-runs)
+- **`output_dir/{subject_id}/{camera}/{subject_id}_{camera}_gaze_object_probabilities.settings.json`** — settings the `.pkl` was computed with, used to decide whether the cache can be reused
+- **`output_dir/{subject_id}/{camera}/{subject_id}_{camera}_gaze_blink_labeled.csv`** — blink-labeled gaze data when `--blink-dir` is used
+- **`output_dir/{subject_id}/{camera}/{subject_id}_{camera}_gaze_blink_removed.csv`** — blink-removed gaze data when `--blink-dir` is used
+- **`output_dir/{subject_id}/{camera}/figures/`** — trajectory plots and confidence heatmaps (PNG and PDF)
+
+With `--ignore-object-list`, the CSV, `.pkl` and `.settings.json` names get an `_excluding_ignored_objects` suffix.
 - **`output_dir/gaze_object.log`** — processing log (or path set by `--log-path`)
 
 The main output CSV keeps the original gaze columns and any extra gaze metadata, then adds:
@@ -140,7 +145,7 @@ The main output CSV keeps the original gaze columns and any extra gaze metadata,
 
 ## Mask Formats
 
-The script auto-detects and prefers per-frame **NPZ** mask bundles (`masks_f000000.npz`) when present, falling back to per-object **PNG** masks. Both pipelines can produce either format (`--mask-format npz`); see the pipeline guides for details.
+For SAM2 mask folders the script reads the per-frame **NPZ** bundle (`masks_f000000.npz`) when present, plus any per-object **PNG** or **NPZ** masks (`mask_f000000_<name>_id<N>.png/.npz`) of objects not already in the bundle. A SAM3 project handed off to SAM2 mixes these in `sam2_results/masks/`: SAM3 masks are hard-linked with their original extension and covered-object unions are per-object files. Both pipelines can produce either format (`--mask-format npz`); see the pipeline guides for details.
 
 ## Citation
 

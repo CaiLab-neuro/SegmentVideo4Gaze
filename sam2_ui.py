@@ -256,6 +256,9 @@ class SAM2VideoUI:
         # SAM2 objects declared "covered by SAM3" — read-only, masks are union of sub-ids
         # {int_id: {"name": str, "color": list, "sam3_sub_ids": list[int]}}
         self.sam2_covered_ids: dict = {}
+        # SAM2 ids of SAM3 instances deleted in the SAM3 project (handoff "retired_ids").
+        # Reserved: never reused for a new object and not annotatable here.
+        self.sam3_retired_ids: set = set()
 
         # Multi-frame annotation mode (always enabled)
         self.multi_frame_annotation_mode = True
@@ -1862,6 +1865,7 @@ class SAM2VideoUI:
             # their masks are the union of sam3_sub_ids computed at sam2_process time).
             covered_raw = handoff.get("sam2_covered_ids", {})
             self.sam2_covered_ids = {int(k): v for k, v in covered_raw.items()}
+            self.sam3_retired_ids = {int(k) for k in handoff.get("retired_ids", {})}
             for cid, info in self.sam2_covered_ids.items():
                 self.sam3_object_ids.add(cid)
                 self.object_names[cid] = info.get("name", f"Object_{cid}")
@@ -1876,7 +1880,9 @@ class SAM2VideoUI:
                 for frame_idx in range(num_frames)
             }
 
-            all_ids_in_handoff = set(int(k) for k in mapping) | set(self.sam2_covered_ids)
+            # Include retired ids so add_new_object() never reuses one.
+            all_ids_in_handoff = (set(int(k) for k in mapping) | set(self.sam2_covered_ids)
+                                  | self.sam3_retired_ids)
             self.max_object_id = max(all_ids_in_handoff) if all_ids_in_handoff else 1
             self.object_var.set(self.current_object_id)
             self.object_spinbox.config(to=self.max_object_id)
@@ -4192,6 +4198,10 @@ class SAM2VideoUI:
         if self.current_object_id in self.sam3_object_ids:
             self.status_label.config(
                 text=f"Object {self.current_object_id} was segmented by SAM3 - select a different object to annotate.")
+            return
+        if self.current_object_id in self.sam3_retired_ids:
+            self.status_label.config(
+                text=f"Object id {self.current_object_id} belonged to a deleted SAM3 instance and is reserved - select a different object to annotate.")
             return
 
         # Get canvas coordinates
@@ -7788,7 +7798,10 @@ class SAM2VideoUI:
         # SAM3 sub-instance masks (mirrors sam2_process.py covered-union computation).
         covered_info = self.sam2_covered_ids.get(obj_id)
         if covered_info is not None:
-            sub_ids = [int(s) for s in covered_info.get("sam3_sub_ids", [])]
+            # Retired sub-ids are deleted SAM3 instances: no longer part of the union
+            # (sam2_process.py skips them too, as they are absent from sam3_mask_dirs).
+            sub_ids = [int(s) for s in covered_info.get("sam3_sub_ids", [])
+                       if int(s) not in self.sam3_retired_ids]
             union = None
             for sub_id in sub_ids:
                 sub_mask = self._load_mask(frame_idx, sub_id)

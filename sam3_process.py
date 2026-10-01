@@ -1075,15 +1075,19 @@ def handle_export_sam2(args):
             print("WARNING: Could not read existing sam2_handoff.json — creating fresh.")
 
     existing_mapping: dict = existing_handoff.get("object_mapping", {})
+    # SAM2 ids of SAM3 instances deleted after an earlier export. They stay reserved (never
+    # handed to another object, so older outputs stay unambiguous) and are reinstated if the
+    # instance is restored in SAM3.
+    existing_retired: dict = existing_handoff.get("retired_ids", {})
     # Build reverse lookup: (concept_name, sam3_obj_id) → sam2_obj_id
     reverse_lookup: dict = {}
-    for sam2_id_str, entry in existing_mapping.items():
+    for sam2_id_str, entry in list(existing_retired.items()) + list(existing_mapping.items()):
         key = (entry.get("concept"), entry.get("instance_id"))
         reverse_lookup[key] = int(sam2_id_str)
 
     # IDs reserved in the handoff or the CSV — auto-assign always stays above max(csv_ids)
     # so gaps in the CSV (unassigned SAM2 objects) remain available for SAM2 to use natively.
-    reserved_ids: set = {int(k) for k in existing_mapping}
+    reserved_ids: set = {int(k) for k in existing_mapping} | {int(k) for k in existing_retired}
     if csv_name_map:
         reserved_ids.update(e["id"] for e in csv_name_map.values())
 
@@ -1097,6 +1101,7 @@ def handle_export_sam2(args):
 
     next_id = _next_free_id(reserved_ids)
     new_mapping: dict = dict(existing_mapping)
+    new_retired: dict = dict(existing_retired)
     new_colors: dict = dict(existing_handoff.get("object_colors", {}))
     # Track which CSV IDs were consumed (by direct name-match or interactive merge-into)
     used_csv_ids: set = set()
@@ -1165,6 +1170,8 @@ def handle_export_sam2(args):
                 reserved_ids.add(sam2_id)
                 next_id = _next_free_id(reserved_ids)
 
+            if new_retired.pop(str(sam2_id), None) is not None:
+                print(f"  Restored '{inst.user_name}' (concept={concept.name}) -> SAM2 id {sam2_id}")
             new_mapping[str(sam2_id)] = {
                 "concept": concept.name,
                 "instance_id": inst.sam3_obj_id,
@@ -1173,6 +1180,14 @@ def handle_export_sam2(args):
                 "mask_filename_pattern": "{frame:06d}." + mask_format,
             }
             new_colors[str(sam2_id)] = list(color)
+
+    # Retire mapping entries whose SAM3 instance was deleted (or whose concept is gone),
+    # so sam2_ui.py / sam2_process.py stop using them; their ids stay reserved.
+    from sam3_utils import retire_deleted_handoff_ids
+    new_mapping, new_retired, retire_messages = retire_deleted_handoff_ids(
+        project, new_mapping, new_retired, new_covered)
+    for message in retire_messages:
+        print(f"  {message}")
 
     # Warn about cross-concept name duplicates
     for name, locs in seen_names_global.items():
@@ -1253,6 +1268,7 @@ def handle_export_sam2(args):
         "object_mapping": new_mapping,
         "object_colors": new_colors,
         "sam2_covered_ids": new_covered,
+        "retired_ids": new_retired,
         "sam2_results_subdir": "sam2_results",
     }
     with open(handoff_path, "w") as f:

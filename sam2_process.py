@@ -110,13 +110,27 @@ def _read_mask(mask_path, cv2_mod):
 
 
 def _write_mask(dst_path, mask, cv2_mod):
-    """Write a uint8 mask array to dst_path (PNG or NPZ determined by suffix)."""
+    """Write a uint8 mask array to dst_path (PNG or NPZ determined by suffix).
+
+    Writes to a temporary file and renames it over dst_path. dst_path may be a hard link
+    into a SAM3 project left by an earlier run (_link_sam3_masks_to_output); writing in
+    place would overwrite the SAM3 original through the shared inode, while the rename
+    only replaces this directory entry.
+    """
     dst_path = Path(dst_path)
-    if dst_path.suffix == ".npz":
-        import numpy as _np
-        _np.savez_compressed(str(dst_path), mask=mask)
-    else:
-        cv2_mod.imwrite(str(dst_path), mask)
+    tmp_path = dst_path.with_name(f".{dst_path.stem}.tmp{os.getpid()}{dst_path.suffix}")
+    try:
+        if dst_path.suffix == ".npz":
+            import numpy as _np
+            _np.savez_compressed(str(tmp_path), mask=mask)
+            ok = True
+        else:
+            ok = cv2_mod.imwrite(str(tmp_path), mask)
+        if ok:
+            os.replace(str(tmp_path), str(dst_path))
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
 
 
 def _make_merged_mask_loader(masks_dir, masks_by_frame):
@@ -149,6 +163,43 @@ def _make_merged_mask_loader(masks_dir, masks_by_frame):
         return (m > 0).astype(np.uint8) * 255 if m is not None else None
 
     return _loader
+
+
+_PER_OBJECT_MASK_RE = re.compile(r"^mask_f\d{6}_.+_id(\d+)\.(png|npz)$")
+
+
+def _read_retired_sam3_ids(sam3_project) -> set:
+    """SAM2 ids of deleted SAM3 instances, from <sam3_project>/sam2_handoff.json "retired_ids"."""
+    if sam3_project is None:
+        return set()
+    handoff_path = Path(sam3_project) / "sam2_handoff.json"
+    if not handoff_path.exists():
+        return set()
+    try:
+        with open(handoff_path) as f:
+            return {int(k) for k in json.load(f).get("retired_ids", {})}
+    except Exception as e:
+        print(f"WARNING: could not read retired_ids from {handoff_path}: {e}")
+        return set()
+
+
+def _remove_retired_mask_files(masks_dir, retired_ids) -> int:
+    """Delete per-object mask files (mask_f*_<name>_id<N>.png/.npz) of retired ids.
+
+    These are hard links (or copies) of SAM3 masks made by an earlier run, or covered/
+    multi-instance unions. Unlinking a hard link leaves the SAM3 original intact.
+    Per-frame NPZ bundles are never touched (SAM3 masks are not stored in them).
+    """
+    masks_dir = Path(masks_dir)
+    if not retired_ids or not masks_dir.is_dir():
+        return 0
+    removed = 0
+    for f in masks_dir.iterdir():
+        m = _PER_OBJECT_MASK_RE.match(f.name)
+        if m and int(m.group(1)) in retired_ids:
+            f.unlink()
+            removed += 1
+    return removed
 
 
 def _link_sam3_masks_to_output(sam3_project, sam3_mask_dirs_rel, obj_ids,
@@ -1849,6 +1900,21 @@ Examples:
         print(f"SAM2 covered IDs (declared done by SAM3, excluded from re-segmentation): "
               f"{sorted(covered_set)}")
 
+    # SAM3 instances deleted since this annotation file was saved: sam3_process.py
+    # --export-sam2 moved their ids to "retired_ids" in the handoff. The handoff is the
+    # source of truth, so drop them here even if this (older) annotation file still lists
+    # them, and remove their stale masks from the output below. An id that has its own
+    # click annotations is a SAM2-native object and is left alone.
+    annotated_ids = {a["object_id"] for a in full_annotations_data.get("annotations", [])}
+    retired_ids = _read_retired_sam3_ids(sam3_project) - annotated_ids
+    if retired_ids:
+        dropped = sorted(retired_ids & (sam3_obj_ids | {int(k) for k in sam3_mask_dirs_rel}))
+        sam3_obj_ids -= retired_ids
+        sam3_mask_dirs_rel = {k: v for k, v in sam3_mask_dirs_rel.items() if int(k) not in retired_ids}
+        unchanged_ids -= retired_ids
+        if dropped:
+            print(f"Skipping retired SAM3 ids {dropped} (instances deleted in the SAM3 project)")
+
     if sam3_obj_ids and sam3_project:
         # Remove SAM3 objects from unchanged_ids — they'll be linked from native paths
         unchanged_ids -= sam3_obj_ids
@@ -1900,7 +1966,6 @@ Examples:
 
         print(f"\nOK: Generated masks for {len(masks_by_frame)} frames")
 
-        _unchanged_merge_ok = False
         # --only-updated: merge unchanged masks from prev_results into masks_by_frame
         if unchanged_ids and prev_results_dir is not None:
             prev_masks_dir = prev_results_dir / "masks"
@@ -1964,11 +2029,16 @@ Examples:
                 for oid, name in prev_names.items():
                     object_names[str(oid)] = name
                 print(f"Reused masks for unchanged objects {sorted(unchanged_ids)} from {prev_masks_dir}")
-                _unchanged_merge_ok = True
                 # Quality metrics for the merged set are recomputed once below, after SAM3
                 # links and covered-union masks have also been added to masks_by_frame.
             else:
                 print(f"WARNING: No masks found in {prev_masks_dir} for unchanged objects {sorted(unchanged_ids)}")
+
+        if retired_ids:
+            n_removed = _remove_retired_mask_files(output_dir / "masks", retired_ids)
+            if n_removed:
+                print(f"Removed {n_removed} stale mask file(s) of retired SAM3 ids "
+                      f"{sorted(retired_ids)} from {output_dir / 'masks'}")
 
         # Link SAM3 native masks into output_dir/masks/ (zero storage via hard links)
         if sam3_obj_ids and sam3_project and sam3_mask_dirs_rel:
@@ -2031,10 +2101,9 @@ Examples:
         # Recompute quality metrics over the full merged mask set (SAM2-propagated +
         # --only-updated reused + SAM3-linked instances + SAM2 covered-union masks).
         # Gated by _will_recompute_quality so plain SAM2 runs keep the incremental metrics.
-        _do_quality_recompute = _will_recompute_quality and (
-            _sam3_will_merge or _unchanged_merge_ok
-        )
-        if _do_quality_recompute:
+        # Always recompute when the intermediate save was skipped, even if no merge happened
+        # (e.g. --only-updated found no previous masks): otherwise no metrics file is written.
+        if _will_recompute_quality:
             print("Recalculating quality metrics over all objects "
                   "(SAM2 + SAM3 + covered unions)...")
             from utils import calculate_quality_metrics

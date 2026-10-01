@@ -185,12 +185,32 @@ def sam3_mask_path(output_dir: str, frame_idx: int, mask_format: str = "png") ->
     return os.path.join(output_dir, f"{frame_idx:06d}.{ext}")
 
 
+def mask_bbox(mask: np.ndarray) -> np.ndarray:
+    """Bounding box of the nonzero pixels of a 2D mask.
+
+    Returns int32 ``[x_min, y_min, x_max, y_max]`` in pixels, max inclusive (the same
+    convention as SAM3's own masks_to_boxes, before its normalization to xywh), or
+    ``[-1, -1, -1, -1]`` for an empty mask.
+    """
+    rows = np.flatnonzero(np.any(mask, axis=1))
+    if rows.size == 0:
+        return np.full(4, -1, dtype=np.int32)
+    cols = np.flatnonzero(np.any(mask, axis=0))
+    return np.array([cols[0], rows[0], cols[-1], rows[-1]], dtype=np.int32)
+
+
 def save_sam3_mask(mask: np.ndarray, output_dir: str, frame_idx: int, mask_format: str = "png") -> str:
     """
     Save SAM3 mask with simple frame-number filename.
 
     Directory path encodes concept + instance hierarchy, so filename only needs frame number.
     Example: concepts/person/instances/0/masks/000000.png (or .npz)
+
+    NPZ files also store the mask's bounding box under the key ``bbox`` (see mask_bbox).
+    It is computed from the mask actually saved rather than taken from SAM3's
+    out_boxes_xywh, which SAM3 computes before its non-overlap step and which is absent
+    for refined or merged masks. ``np.load(path)["bbox"]`` reads it without decompressing
+    the mask. PNG files have no room for it.
 
     Args:
         mask: Binary mask (H, W) numpy array (0/255 uint8 or bool)
@@ -206,7 +226,7 @@ def save_sam3_mask(mask: np.ndarray, output_dir: str, frame_idx: int, mask_forma
         mask = mask.astype(np.uint8) * 255
     mask_path = sam3_mask_path(output_dir, frame_idx, mask_format)
     if mask_format == "npz":
-        np.savez_compressed(mask_path, mask=mask)
+        np.savez_compressed(mask_path, mask=mask, bbox=mask_bbox(mask))
     else:
         cv2.imwrite(mask_path, mask)
     return mask_path
@@ -967,6 +987,82 @@ class DynamicFrameCompositor:
     def __del__(self):
         """Cleanup on destruction"""
         self.release()
+
+
+def retire_deleted_handoff_ids(
+    project: SAM3Project,
+    mapping: dict,
+    retired: dict,
+    covered: Optional[dict] = None,
+) -> Tuple[dict, dict, List[str]]:
+    """Reconcile a sam2_handoff.json object_mapping with the project's live instances.
+
+    Deleting an instance in SAM3 only sets a flag (its mask files stay on disk), so a
+    mapping entry carried over from an earlier export would keep the instance alive in
+    sam2_ui.py and sam2_process.py. Here such entries move from ``mapping`` to ``retired``
+    (handoff "retired_ids"), which keeps the SAM2 id reserved so it is never reused.
+    Multi-instance union entries (``mask_sub_instances``) lose their deleted parts and are
+    retired only when no part is left. Any id present in ``mapping`` is removed from
+    ``retired``, so an instance restored in SAM3 (and re-assigned its old id by the caller)
+    is reinstated. Entries without SAM3 instance fields are left untouched.
+
+    Args:
+        project: The SAM3 project.
+        mapping: object_mapping after the caller's (re)assignments, {sam2_id_str: entry}.
+        retired: retired_ids from the existing handoff, {sam2_id_str: entry}.
+        covered: sam2_covered_ids (only used to warn about retired sub-ids).
+
+    Returns:
+        (new_mapping, new_retired, messages) - messages describe each change.
+    """
+    live = {
+        (concept.name, inst.sam3_obj_id)
+        for concept in project.concepts
+        for inst in concept.instances
+        if not inst.deleted
+    }
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    new_mapping = dict(mapping)
+    new_retired = {k: v for k, v in retired.items() if k not in new_mapping}
+    messages: List[str] = []
+
+    for sam2_id, entry in list(new_mapping.items()):
+        subs = entry.get("mask_sub_instances")
+        if subs:
+            kept = [s for s in subs if (s.get("concept"), s.get("instance_id")) in live]
+            if len(kept) == len(subs):
+                continue
+            dropped = ", ".join(f"'{s.get('name')}' ({s.get('concept')})"
+                                for s in subs if s not in kept)
+            if kept:
+                new_mapping[sam2_id] = dict(entry, mask_sub_instances=kept)
+                messages.append(f"SAM2 id {sam2_id} ('{entry.get('name', '')}'): deleted "
+                                f"part(s) {dropped} removed from its union.")
+            else:
+                new_retired[sam2_id] = {"name": entry.get("name", ""),
+                                        "mask_sub_instances": subs, "retired": now}
+                del new_mapping[sam2_id]
+                messages.append(f"Retired SAM2 id {sam2_id} ('{entry.get('name', '')}'): all "
+                                f"parts of its union were deleted. The id stays reserved.")
+            continue
+        concept_name, instance_id = entry.get("concept"), entry.get("instance_id")
+        if concept_name is None or instance_id is None:
+            continue
+        if (concept_name, instance_id) not in live:
+            new_retired[sam2_id] = {"concept": concept_name, "instance_id": instance_id,
+                                    "name": entry.get("name", ""), "retired": now}
+            del new_mapping[sam2_id]
+            messages.append(f"Retired SAM2 id {sam2_id} ('{entry.get('name', '')}', "
+                            f"concept={concept_name}): SAM3 instance deleted. "
+                            f"The id stays reserved.")
+
+    for cid, info in (covered or {}).items():
+        stale = [s for s in info.get("sam3_sub_ids", []) if str(s) in new_retired]
+        if stale:
+            messages.append(f"WARNING: covered object '{info.get('name', cid)}' (id {cid}) "
+                            f"lists retired sub-id(s) {stale}; their masks are no longer "
+                            f"part of its union.")
+    return new_mapping, new_retired, messages
 
 
 def export_to_sam2_format(

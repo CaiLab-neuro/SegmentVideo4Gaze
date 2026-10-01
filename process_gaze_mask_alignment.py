@@ -29,6 +29,18 @@ from pathlib import Path
 from typing import Optional
 
 
+# Default frame-scoring processes per subject-camera pair (capped by available CPUs).
+DEFAULT_WITHIN_JOB_WORKERS = 4
+
+
+def _available_cpus() -> int:
+    """CPUs this process may run on (respects taskset/cgroup affinity where supported)."""
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        return max(1, os.cpu_count() or 1)
+
+
 @functools.lru_cache(maxsize=8)
 def _disk_template(r: int) -> np.ndarray:
     """Pre-compute a boolean disk of radius r, shape (2r+1, 2r+1). Cached across calls."""
@@ -102,11 +114,28 @@ def _sam3_mask_labels(mask_key: str) -> set:
     return labels
 
 
+def _binarize(mask: np.ndarray, crop: Optional[tuple] = None, shapes: Optional[set] = None) -> np.ndarray:
+    """Return ``(mask > 0)`` as uint8, optionally cropped to ``crop = (y0, y1, x0, x1)``.
+
+    Cropping before binarizing avoids two full-frame passes per mask when only the
+    neighbourhood of the gaze points is scored. ``shapes`` (if given) collects the
+    full-frame shape so callers can still detect masks of mismatched size.
+    """
+    if shapes is not None:
+        shapes.add(mask.shape)
+    if crop is not None:
+        y0, y1, x0, x1 = crop
+        mask = mask[y0:y1, x0:x1]
+    return (mask > 0).astype(np.uint8)
+
+
 def _load_sam3_masks_for_frame(
     project_dir: str,
     frame_idx: int,
     sam3_instances: list,
     ignore_labels: set = None,
+    crop: Optional[tuple] = None,
+    shapes: Optional[set] = None,
 ) -> dict:
     """Load SAM3 masks for one frame from the hierarchical project directory.
 
@@ -116,9 +145,11 @@ def _load_sam3_masks_for_frame(
         sam3_instances: List of (concept_name, user_name, sam3_obj_id) for non-deleted instances.
         ignore_labels: Normalized label set from --ignore-object-list; entries that match
             any label of an instance are skipped.
+        crop: Optional (y0, y1, x0, x1) region to keep (see _binarize).
+        shapes: Optional set that collects each mask's full-frame shape.
 
     Returns:
-        Dict mapping virtual mask keys to (H, W) uint8 binary arrays.
+        Dict mapping virtual mask keys to uint8 binary arrays ((H, W), or the crop).
     """
     frame_id_str = f"{frame_idx:06d}"
     masks = {}
@@ -134,11 +165,11 @@ def _load_sam3_masks_for_frame(
         png_path = os.path.join(inst_mask_dir, f"{frame_id_str}.png")
         if os.path.exists(npz_path):
             data = np.load(npz_path)
-            masks[mask_key] = (data["mask"] > 0).astype(np.uint8)
+            masks[mask_key] = _binarize(data["mask"], crop, shapes)
         elif os.path.exists(png_path):
             mask = cv2.imread(png_path, cv2.IMREAD_GRAYSCALE)
             if mask is not None:
-                masks[mask_key] = (mask > 0).astype(np.uint8)
+                masks[mask_key] = _binarize(mask, crop, shapes)
     return masks
 
 
@@ -167,20 +198,32 @@ def _load_sam2_masks_for_frame(
     frame_idx: int,
     ignore_labels: set = None,
     exclude_id_labels: set = None,
+    crop: Optional[tuple] = None,
+    shapes: Optional[set] = None,
 ) -> dict:
-    """Load SAM2-style masks for one frame (per-frame NPZ, else per-object PNGs).
+    """Load SAM2-style masks for one frame.
+
+    Reads the per-frame bundle ``masks_f{frame:06d}.npz`` (if present) AND any
+    per-object ``*mask_f{frame:06d}*.png`` / ``*.npz`` files beside it. A converted
+    SAM3 project's sam2_results/masks/ mixes these: sam2_process.py hard-links SAM3
+    masks with their source extension (per-object NPZ for an NPZ project) and writes
+    covered-union masks as per-object files, while SAM2-propagated objects may live in
+    the bundle. An object already read from the bundle is not read again from a
+    per-object file of the same name.
 
     Args:
-        mask_dir: Directory holding ``masks_f{frame:06d}.npz`` or ``*mask_f{frame:06d}*.png``.
+        mask_dir: SAM2 masks directory.
         ignore_labels: Normalized labels (from --ignore-object-list) - any mask whose
             labels intersect this set is skipped.
         exclude_id_labels: Normalized id tokens (e.g. ``{"id5", "5"}``) - masks with a
             matching object id are skipped. Used in ``pipeline=both`` to drop SAM2 masks
             that are really SAM3 instances linked/unioned by sam2_process.py.
+        crop: Optional (y0, y1, x0, x1) region to keep (see _binarize).
+        shapes: Optional set that collects each mask's full-frame shape.
 
     Returns:
-        Dict mapping mask filename (npz keys get a ``.png`` suffix, matching legacy
-        behaviour) to (H, W) uint8 binary arrays.
+        Dict mapping mask filename (always with a ``.png`` suffix, matching legacy
+        behaviour) to uint8 binary arrays ((H, W), or the crop).
     """
     frame_id_str = f"{frame_idx:06d}"
 
@@ -200,15 +243,30 @@ def _load_sam2_masks_for_frame(
             key = k + ".png"
             if _skip(key):
                 continue
-            masks[key] = (data[k] > 0).astype(np.uint8)
-    else:
-        pattern = os.path.join(mask_dir, f"*mask_f{frame_id_str}*.png")
-        for mask_path in sorted(glob.glob(pattern)):
-            if _skip(os.path.basename(mask_path)):
-                continue
+            masks[key] = _binarize(data[k], crop, shapes)
+
+    pattern = os.path.join(mask_dir, f"*mask_f{frame_id_str}*")
+    for mask_path in sorted(glob.glob(pattern)):
+        name = os.path.basename(mask_path)
+        stem, ext = os.path.splitext(name)
+        if ext not in (".png", ".npz"):
+            continue
+        key = stem + ".png"
+        if key in masks or _skip(name):
+            continue
+        if ext == ".png":
             mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-            if mask is not None:
-                masks[os.path.basename(mask_path)] = np.where(mask > 0, 1, 0).astype(np.uint8)
+        else:
+            # Per-object NPZ (SAM3 link / covered union) stores the array under 'mask'.
+            data = np.load(mask_path)
+            if "mask" in data.files:
+                mask = data["mask"]
+            elif len(data.files) == 1:
+                mask = data[data.files[0]]
+            else:
+                continue
+        if mask is not None:
+            masks[key] = _binarize(mask, crop, shapes)
     return masks
 
 
@@ -232,7 +290,8 @@ def _sam2_native_masks_dir(project_dir) -> Optional[Path]:
 
 def _read_handoff_sam3_derived_id_labels(project_dir) -> set:
     """Normalized id tokens for every SAM2 object in sam2_handoff.json that is actually a
-    SAM3 instance (object_mapping) or a covered-union (sam2_covered_ids).
+    SAM3 instance (object_mapping), a covered-union (sam2_covered_ids), or a deleted SAM3
+    instance (retired_ids).
 
     Used by ``pipeline=both`` to avoid double-counting: those SAM2 masks in
     sam2_results/masks/ are dropped in favour of the canonical SAM3 hierarchy masks.
@@ -247,47 +306,92 @@ def _read_handoff_sam3_derived_id_labels(project_dir) -> set:
             data = json.load(f)
     except Exception:
         return labels
-    for key_group in (data.get("object_mapping", {}), data.get("sam2_covered_ids", {})):
+    # retired_ids: SAM3 instances deleted after an earlier export. Their masks may still sit
+    # in sam2_results/masks/ until sam2_process.py is re-run; never score them as SAM2 objects.
+    for key_group in (data.get("object_mapping", {}), data.get("sam2_covered_ids", {}),
+                      data.get("retired_ids", {})):
         for sam2_id in key_group:
             labels.add(_normalize_label(f"id{sam2_id}"))
             labels.add(_normalize_label(str(sam2_id)))
     return labels
 
 
-def _frame_group_worker(args):
+# Per-subject settings shared by every frame task. Set once per worker process by
+# _init_frame_worker (so each task only ships its frame index and gaze points), or
+# passed explicitly on the serial path. Keys:
+#   mask_dir        SAM3 project dir (SAM3 mode) or SAM2 masks dir (SAM2 mode)
+#   r               gaze disk radius in pixels
+#   sam3_instances  list of (concept, user_name, sam3_obj_id), or None for SAM2 mode
+#   ignore_labels   set of normalized labels to skip (SAM2 mode; SAM3 instances are
+#                   pre-filtered by the caller)
+#   sam2_extra      None, or {"dir", "exclude_id_labels", "ignore_labels"} for pipeline=both
+_WORKER_CONTEXT: Optional[dict] = None
+
+
+def _init_frame_worker(context: dict) -> None:
+    global _WORKER_CONTEXT
+    _WORKER_CONTEXT = context
+
+
+def _gaze_crop(gaze_points: list, r: int) -> tuple:
+    """Smallest (y0, y1, x0, x1) region holding every gaze disk of one frame.
+
+    Lower bounds are clamped to 0 and upper bounds to >= the lower bound; numpy slicing
+    then clamps the upper bounds to the frame. The crop therefore clips each disk exactly
+    like the full frame does, so scoring the crop with shifted coordinates gives the
+    same result as scoring the full frame.
+    """
+    xs = [xi for _, xi, _ in gaze_points]
+    ys = [yi for _, _, yi in gaze_points]
+    x0 = max(0, min(xs) - r)
+    y0 = max(0, min(ys) - r)
+    x1 = max(x0, max(xs) + r + 1)
+    y1 = max(y0, max(ys) + r + 1)
+    return y0, y1, x0, x1
+
+
+def _frame_group_worker(task, context: Optional[dict] = None):
     """Worker: load masks for one frame, score all gaze points, return partial probabilities.
 
-    args is a 4- to 6-tuple:
-        (frame_idx, gaze_points, mask_dir, r)                              # SAM2 mode
-        (frame_idx, gaze_points, project_dir, r, sam3_instances)           # SAM3 mode
-        (frame_idx, gaze_points, project_dir, r, sam3_instances, sam2_extra)  # both mode
-    where sam2_extra = (sam2_masks_dir, exclude_id_labels, ignore_labels) or None.
+    task is (frame_idx, gaze_points) with gaze_points a list of (gaze_index, xi, yi).
+    context defaults to the per-process _WORKER_CONTEXT (see above).
     """
-    frame_idx, gaze_points, mask_dir, r = args[:4]
-    sam3_instances = args[4] if len(args) > 4 else None
-    sam2_extra = args[5] if len(args) > 5 else None
+    frame_idx, gaze_points = task
+    ctx = context if context is not None else _WORKER_CONTEXT
+    mask_dir = ctx["mask_dir"]
+    r = ctx["r"]
+    sam3_instances = ctx["sam3_instances"]
+    sam2_extra = ctx["sam2_extra"]
     disk = _disk_template(r)
+    crop = _gaze_crop(gaze_points, r)
+    shapes: set = set()
 
     if sam3_instances is not None:
         # SAM3 mode: masks live under concepts/<concept>/instances/<id>/masks/
-        masks = _load_sam3_masks_for_frame(mask_dir, frame_idx, sam3_instances)
+        masks = _load_sam3_masks_for_frame(
+            mask_dir, frame_idx, sam3_instances, crop=crop, shapes=shapes)
         if sam2_extra is not None:
             # both mode: add SAM2-native objects, minus SAM3-derived / covered ids.
-            s2_dir, exclude_id_labels, ignore_labels = sam2_extra
             masks.update(_load_sam2_masks_for_frame(
-                s2_dir, frame_idx, set(ignore_labels), set(exclude_id_labels)))
+                sam2_extra["dir"], frame_idx, sam2_extra["ignore_labels"],
+                sam2_extra["exclude_id_labels"], crop=crop, shapes=shapes))
     else:
         # SAM2 mode
-        masks = _load_sam2_masks_for_frame(mask_dir, frame_idx)
+        masks = _load_sam2_masks_for_frame(
+            mask_dir, frame_idx, ctx["ignore_labels"], crop=crop, shapes=shapes)
 
     if not masks:
         return {}, False
+    if len(shapes) > 1:
+        raise ValueError(
+            f"Masks for frame {frame_idx} have different sizes {sorted(shapes)} in {mask_dir}")
 
+    y0, _, x0, _ = crop
     mask_names = list(masks.keys())
     stacked = np.stack(list(masks.values()))
     result = {}
     for gaze_idx, xi, yi in gaze_points:
-        confs = _score_gaze_all_masks(stacked, xi, yi, r, disk)
+        confs = _score_gaze_all_masks(stacked, xi - x0, yi - y0, r, disk)
         result[gaze_idx] = dict(zip(mask_names, confs.tolist()))
     return result, True
 
@@ -479,7 +583,11 @@ class GazeObjectAligner:
         gaze_confidence_threshold: float = 0.5,
         gaze_radius: int = 20,
         pipeline: str = "auto",
+        vector_figures: bool = False,
     ):
+        # vector_figures: keep the dense heatmap/trajectory as vector graphics in the PDF
+        # (exact, but large and slow for long recordings). Default rasterizes them.
+        self.vector_figures = vector_figures
         # pipeline: "auto" (SAM3 if project.json else SAM2), "sam3" (SAM3 instances only),
         # "sam2" (SAM2 masks only; for a converted project uses sam2_results/masks/),
         # "both" (SAM3 instances + SAM2-native objects, de-duplicated via sam2_handoff.json)
@@ -678,7 +786,11 @@ class GazeObjectAligner:
         frame_ids = sorted(
             {
                 int(match.group(1))
-                for mask_path in list(mask_dir.glob("masks_f*.npz")) + list(mask_dir.glob("*.png"))
+                for mask_path in (
+                    list(mask_dir.glob("masks_f*.npz"))
+                    + list(mask_dir.glob("*mask_f*.npz"))
+                    + list(mask_dir.glob("*.png"))
+                )
                 for match in [frame_pattern.search(mask_path.name)]
                 if match is not None
             }
@@ -930,11 +1042,22 @@ class GazeObjectAligner:
         # never won the per-point argmax label (e.g. consistently second-best behind a
         # larger overlapping mask), so both the heatmap and frequency-based sorting reflect
         # the full population of scores, not just who "won" each point.
+        # Mask names repeat across the gaze samples of a frame, so cache the name parsing.
+        category_cache: dict = {}
+
+        def _category(mask_name: str) -> str:
+            category = category_cache.get(mask_name)
+            if category is None:
+                category = category_cache[mask_name] = self._mask_name_to_category(mask_name)
+            return category
+
         heatmap_categories = list(real_categories)
+        seen_categories = set(heatmap_categories)
         for probs_one_gaze in subject_gaze_probabilities.values():
             for mask_name in probs_one_gaze.keys():
-                category = self._mask_name_to_category(mask_name)
-                if category not in heatmap_categories:
+                category = _category(mask_name)
+                if category not in seen_categories:
+                    seen_categories.add(category)
                     heatmap_categories.append(category)
 
         heatmap_row = {cat: i for i, cat in enumerate(heatmap_categories)}
@@ -944,7 +1067,7 @@ class GazeObjectAligner:
             if probs_one_gaze:
                 per_category_conf = {}
                 for mask_name, conf in probs_one_gaze.items():
-                    category = self._mask_name_to_category(mask_name)
+                    category = _category(mask_name)
                     conf_val = float(conf)
                     if category not in per_category_conf or conf_val > per_category_conf[category]:
                         per_category_conf[category] = conf_val
@@ -995,6 +1118,10 @@ class GazeObjectAligner:
         y_values = np.array([category_to_y[cat] for cat in gaze_categories], dtype=float)
         point_colors = [category_colors[cat] for cat in gaze_categories]
 
+        # Rasterize the per-sample artists unless --vector-figures: as vectors, a long
+        # recording means hundreds of thousands of PDF objects (slow to write and view).
+        rasterize = not self.vector_figures
+        pdf_dpi = 300 if rasterize else None
         trajectory_ax.plot(
             time_s,
             y_values,
@@ -1002,6 +1129,7 @@ class GazeObjectAligner:
             linewidth=1.2,
             alpha=0.85,
             zorder=2,
+            rasterized=rasterize,
         )
         trajectory_ax.scatter(
             time_s,
@@ -1010,6 +1138,7 @@ class GazeObjectAligner:
             s=16,
             edgecolors="none",
             zorder=3,
+            rasterized=rasterize,
         )
         trajectory_ax.set_yticks(np.arange(len(category_order)))
         trajectory_ax.set_yticklabels([display_map.get(cat, cat) for cat in category_order])
@@ -1024,7 +1153,7 @@ class GazeObjectAligner:
         trajectory_png = figures_dir / f"{subject_id_temp}_{camera_temp}_trajectory_plot.png"
         trajectory_pdf = figures_dir / f"{subject_id_temp}_{camera_temp}_trajectory_plot.pdf"
         trajectory_fig.savefig(trajectory_png, dpi=300, bbox_inches="tight")
-        trajectory_fig.savefig(trajectory_pdf, bbox_inches="tight")
+        trajectory_fig.savefig(trajectory_pdf, dpi=pdf_dpi, bbox_inches="tight")
         plt.close(trajectory_fig)
         self.logger.info("Saved trajectory plot to %s and %s", trajectory_png, trajectory_pdf)
 
@@ -1039,6 +1168,7 @@ class GazeObjectAligner:
             vmin=0.0,
             vmax=1.0,
             shading="auto",
+            rasterized=rasterize,
         )
         heatmap_ax.set_yticks(np.arange(len(heatmap_categories)) + 0.5)
         heatmap_ax.set_yticklabels([display_map.get(cat, cat) for cat in heatmap_categories])
@@ -1053,9 +1183,55 @@ class GazeObjectAligner:
         heatmap_png = figures_dir / f"{subject_id_temp}_{camera_temp}_confidence_heatmap.png"
         heatmap_pdf = figures_dir / f"{subject_id_temp}_{camera_temp}_confidence_heatmap.pdf"
         heatmap_fig.savefig(heatmap_png, dpi=300, bbox_inches="tight")
-        heatmap_fig.savefig(heatmap_pdf, bbox_inches="tight")
+        heatmap_fig.savefig(heatmap_pdf, dpi=pdf_dpi, bbox_inches="tight")
         plt.close(heatmap_fig)
         self.logger.info("Saved confidence heatmap to %s and %s", heatmap_png, heatmap_pdf)
+
+    def _gaze_csv_path(self, subj: str, camera: str) -> Path:
+        """Gaze CSV for one subject/camera: --gaze-csv if given, else the naming convention."""
+        if self.gaze_csv_path:
+            return Path(self.gaze_csv_path)
+        return Path(self.gaze_world_dir) / f"{subj}_{camera}_gaze.csv"
+
+    def _world_csv_path(self, subj: str, camera: str) -> Path:
+        """World-camera timestamps CSV: --world-csv if given, else the naming convention."""
+        if self.world_csv_path:
+            return Path(self.world_csv_path)
+        return Path(self.gaze_world_dir) / f"{subj}_{camera}_world_timestamps.csv"
+
+    def _assign_best_objects(self, gaze_df: pd.DataFrame, probabilities: dict) -> list:
+        """Fill gazed_object_id / gazed_object / gazed_object_confidence from per-mask scores.
+
+        Per gaze row: the highest-scoring mask wins (first one on ties); its confidence is
+        recorded when > 0 and its label when >= gaze_confidence_threshold. Columns are
+        written in bulk, not cell by cell, which is far faster for long recordings.
+
+        Returns:
+            Confidences of the rows that received a label.
+        """
+        conf_rows, conf_values = [], []
+        label_rows, label_ids, label_names, label_confs = [], [], [], []
+        for i in gaze_df.index:
+            probs = probabilities.get(i)
+            if not probs:
+                continue
+            best_name = max(probs, key=probs.__getitem__)
+            best_conf = float(probs[best_name])
+            if best_conf > 0.0:
+                conf_rows.append(i)
+                conf_values.append(best_conf)
+            if best_conf >= self.gaze_confidence_threshold:
+                parts = best_name.split('.')[0].split('_')
+                label_rows.append(i)
+                label_ids.append(parts[-1])
+                label_names.append('_'.join(parts[2:-1]))
+                label_confs.append(best_conf)
+        if conf_rows:
+            gaze_df.loc[conf_rows, 'gazed_object_confidence'] = conf_values
+        if label_rows:
+            gaze_df.loc[label_rows, 'gazed_object_id'] = label_ids
+            gaze_df.loc[label_rows, 'gazed_object'] = label_names
+        return label_confs
 
     def load_gaze_data(self, subj: str, camera: str) -> tuple[pd.DataFrame, pd.DataFrame, Path]:
         """Load gaze data from a CSV file.
@@ -1068,13 +1244,9 @@ class GazeObjectAligner:
         Returns:
             pd.DataFrame: A DataFrame containing the gaze data within the cut video duration.
         """
-        gaze_path = Path(self.gaze_csv_path) if self.gaze_csv_path else (
-            Path(self.gaze_world_dir) / f"{subj}_{camera}_gaze.csv"
-        )
+        gaze_path = self._gaze_csv_path(subj, camera)
         gaze_dic = pd.read_csv(gaze_path)
-        world_cam_path = Path(self.world_csv_path) if self.world_csv_path else (
-            Path(self.gaze_world_dir) / f"{subj}_{camera}_world_timestamps.csv"
-        )
+        world_cam_path = self._world_csv_path(subj, camera)
         world_cam_dic = pd.read_csv(world_cam_path)
         self.logger.info(
             "Loaded gaze/world CSV: gaze_rows=%d world_rows=%d",
@@ -1200,7 +1372,7 @@ class GazeObjectAligner:
             # Detect SAM3 vs SAM2 and apply the requested pipeline.
             is_sam3 = self._is_sam3_project(mask_subject)
             sam3_instances = None
-            sam2_extra = None  # set for pipeline="both": (sam2_masks_dir, exclude_ids, ignore)
+            sam2_extra = None  # set for pipeline="both": {"dir", "exclude_id_labels", "ignore_labels"}
 
             if self.pipeline == "sam3" and not is_sam3:
                 raise FileNotFoundError(
@@ -1223,7 +1395,11 @@ class GazeObjectAligner:
                             mask_subject)
                     else:
                         exclude_ids = _read_handoff_sam3_derived_id_labels(mask_subject)
-                        sam2_extra = (str(s2_dir), sorted(exclude_ids), sorted(self.ignore_objects))
+                        sam2_extra = {
+                            "dir": str(s2_dir),
+                            "exclude_id_labels": set(exclude_ids),
+                            "ignore_labels": set(self.ignore_objects),
+                        }
                         self.logger.info(
                             "pipeline=both: SAM3 instances + SAM2-native masks at %s "
                             "(excluding %d SAM3-derived/covered id label(s)).",
@@ -1256,7 +1432,7 @@ class GazeObjectAligner:
             mask_summary = self.summarize_mask_frames(mask_subject)
             if sam2_extra is not None:
                 # both mode: a frame counts as covered if either source has it.
-                s2_summary = self._summarize_sam2_mask_frames(Path(sam2_extra[0]))
+                s2_summary = self._summarize_sam2_mask_frames(Path(sam2_extra["dir"]))
                 merged_ids = mask_summary["frame_ids"] | s2_summary["frame_ids"]
                 mask_summary = {
                     "count": len(merged_ids),
@@ -1318,9 +1494,6 @@ class GazeObjectAligner:
             total_frames = unique_post_blink_frames
             frames_with_masks = 0
             frames_without_masks = 0
-            assigned_gaze_points = 0
-            assigned_confidences = []
-
             gaze_blink_removed['gazed_object_id'] = None
             gaze_blink_removed['gazed_object'] = None
             gaze_blink_removed['gazed_object_confidence'] = 0.0
@@ -1328,79 +1501,101 @@ class GazeObjectAligner:
 
             excluded_objects_suffix = self.excluded_objects_output_suffix()
             pkl_path = out_dir / f"{subject_id_temp}_{camera_temp}_gaze_object_probabilities{excluded_objects_suffix}.pkl"
+            settings_path = pkl_path.with_name(pkl_path.stem + ".settings.json")
+            # Everything that changes which scores the pkl holds. A cached pkl is only reused
+            # when these match, so e.g. switching --pipeline or --gaze-radius recomputes.
+            cache_settings = {
+                "gaze_radius": _r,
+                "pipeline": self.pipeline,
+                "ignore_objects": sorted(self.ignore_objects),
+                "mask_source": str(Path(mask_subject).resolve()),
+                "sam2_extra_dir": str(Path(sam2_extra["dir"]).resolve()) if sam2_extra else None,
+                "gaze_csv": str(self._gaze_csv_path(subject_id_temp, camera_temp).resolve()),
+                # The world CSV decides which frame each gaze sample is scored against.
+                "world_csv": str(self._world_csv_path(subject_id_temp, camera_temp).resolve()),
+                "blink_dir": str(Path(self.blink_dir).resolve()) if self.blink_dir else None,
+            }
             _use_cached_pkl = not self.recompute and pkl_path.exists()
+            if _use_cached_pkl:
+                stored_settings = None
+                if settings_path.exists():
+                    try:
+                        with open(settings_path) as f:
+                            stored_settings = json.load(f)
+                    except Exception as e:
+                        self.logger.warning("Could not read %s (%s); recomputing.", settings_path, e)
+                        _use_cached_pkl = False
+                if stored_settings is not None and stored_settings != cache_settings:
+                    changed = sorted(
+                        k for k in set(stored_settings) | set(cache_settings)
+                        if stored_settings.get(k) != cache_settings.get(k)
+                    )
+                    self.logger.warning(
+                        "Cached probabilities at %s were computed with different settings (%s); "
+                        "recomputing from masks.", pkl_path, ", ".join(changed))
+                    _use_cached_pkl = False
+                elif stored_settings is None and _use_cached_pkl:
+                    self.logger.warning(
+                        "Cached probabilities at %s have no settings record (written by an older "
+                        "version), so radius/pipeline/ignore-list cannot be verified. Reusing them; "
+                        "pass --recompute if any of those changed.", pkl_path)
 
             if _use_cached_pkl:
                 self.logger.warning(
-                    "Found existing probabilities at %s — skipping mask I/O and reassigning from "
+                    "Found existing probabilities at %s - skipping mask I/O and reassigning from "
                     "cached scores. Pass --recompute to force a full run from scratch.",
                     pkl_path,
                 )
                 with open(pkl_path, 'rb') as f:
                     subject_gaze_probabilities = pickle.load(f)
-                for i in gaze_blink_removed.index:
-                    probs = subject_gaze_probabilities.get(i, {})
-                    if probs:
-                        best_name = max(probs, key=lambda k: probs[k])
-                        best_conf = float(probs[best_name])
-                        if best_conf > 0.0:
-                            gaze_blink_removed.loc[i, 'gazed_object_confidence'] = best_conf
-                        if best_conf >= self.gaze_confidence_threshold:
-                            gaze_blink_removed.loc[i, 'gazed_object_id'] = best_name.split('.')[0].split('_')[-1]
-                            gaze_blink_removed.loc[i, 'gazed_object'] = '_'.join(best_name.split('.')[0].split('_')[2:-1])
-                            assigned_gaze_points += 1
-                            assigned_confidences.append(best_conf)
             else:
                 self.logger.info(f"Loading masks from {mask_subject}")
-                frame_groups = []
+                worker_context = {
+                    "mask_dir": str(mask_subject),
+                    "r": _r,
+                    "sam3_instances": sam3_instances if is_sam3 else None,
+                    "ignore_labels": set(self.ignore_objects),
+                    "sam2_extra": sam2_extra if is_sam3 else None,
+                }
+                frame_tasks = []
                 for frame_idx, gdf in gaze_blink_removed.groupby('frame_idx', sort=False):
+                    xs = gdf['gaze x [px]'].to_numpy()
+                    ys = gdf['gaze y [px]'].to_numpy()
                     gaze_points = [
-                        (i, int(round(gdf.loc[i, 'gaze x [px]'])), int(round(gdf.loc[i, 'gaze y [px]'])))
-                        for i in gdf.index
+                        (i, int(round(x)), int(round(y)))
+                        for i, x, y in zip(gdf.index, xs, ys)
                     ]
-                    if is_sam3 and sam2_extra is not None:
-                        frame_groups.append((int(frame_idx), gaze_points, str(mask_subject), _r, sam3_instances, sam2_extra))
-                    elif is_sam3:
-                        frame_groups.append((int(frame_idx), gaze_points, str(mask_subject), _r, sam3_instances))
-                    else:
-                        frame_groups.append((int(frame_idx), gaze_points, str(mask_subject), _r))
+                    frame_tasks.append((int(frame_idx), gaze_points))
 
-                if self.within_job_workers > 1:
-                    with ProcessPoolExecutor(max_workers=self.within_job_workers) as executor:
-                        for partial, has_masks in executor.map(_frame_group_worker, frame_groups):
+                n_workers = min(self.within_job_workers, len(frame_tasks))
+                if n_workers > 1:
+                    # Batch several frames per inter-process round trip; ~4 batches per
+                    # worker keeps the load balanced near the end of the run.
+                    chunksize = max(1, min(32, len(frame_tasks) // (n_workers * 4)))
+                    with ProcessPoolExecutor(
+                        max_workers=n_workers,
+                        initializer=_init_frame_worker,
+                        initargs=(worker_context,),
+                    ) as executor:
+                        results = executor.map(_frame_group_worker, frame_tasks, chunksize=chunksize)
+                        for partial, has_masks in results:
                             if not has_masks:
                                 frames_without_masks += 1
                             else:
                                 frames_with_masks += 1
                                 subject_gaze_probabilities.update(partial)
                 else:
-                    for args in frame_groups:
-                        partial, has_masks = _frame_group_worker(args)
+                    for task in frame_tasks:
+                        partial, has_masks = _frame_group_worker(task, worker_context)
                         if not has_masks:
                             frames_without_masks += 1
                         else:
                             frames_with_masks += 1
                             subject_gaze_probabilities.update(partial)
 
-                for i in gaze_blink_removed.index:
-                    probs = subject_gaze_probabilities.get(i, {})
-                    if not probs:
-                        continue
-                    best_name = max(probs, key=probs.__getitem__)
-                    best_conf = float(probs[best_name])
-                    if best_conf > 0.0:
-                        gaze_blink_removed.loc[i, 'gazed_object_confidence'] = best_conf
-                    if best_conf >= self.gaze_confidence_threshold:
-                        gaze_blink_removed.loc[i, 'gazed_object_id'] = best_name.split('.')[0].split('_')[-1]
-                        gaze_blink_removed.loc[i, 'gazed_object'] = '_'.join(best_name.split('.')[0].split('_')[2:-1])
-                        assigned_gaze_points += 1
-                        assigned_confidences.append(best_conf)
-                        self.logger.debug(
-                            "Processed gaze index %s: gazed object=%s confidence=%.4f",
-                            i,
-                            best_name,
-                            best_conf,
-                        )
+            assigned_confidences = self._assign_best_objects(
+                gaze_blink_removed, subject_gaze_probabilities)
+            assigned_gaze_points = len(assigned_confidences)
 
             assignment_rate = (assigned_gaze_points / total_gaze_points * 100.0) if total_gaze_points > 0 else 0.0
             mean_conf = float(np.mean(assigned_confidences)) if assigned_confidences else 0.0
@@ -1452,6 +1647,8 @@ class GazeObjectAligner:
             if not _use_cached_pkl:
                 with open(pkl_path, 'wb') as f:
                     pickle.dump(subject_gaze_probabilities, f)
+                with open(settings_path, 'w') as f:
+                    json.dump(cache_settings, f, indent=2)
                 self.logger.info(f"Saved probabilities of each mask for each eye gaze to {pkl_path}")
 
             if self.plot_figures:
@@ -1500,6 +1697,7 @@ def process_subject_camera_pair(args):
         gaze_radius,
         log_queue,
         pipeline,
+        vector_figures,
     ) = args
 
     setup_worker_logging(log_queue)
@@ -1522,6 +1720,7 @@ def process_subject_camera_pair(args):
         gaze_confidence_threshold=gaze_confidence_threshold,
         gaze_radius=gaze_radius,
         pipeline=pipeline,
+        vector_figures=vector_figures,
     )
     logger.info("Processing started.")
     gaze_aligner.process_subject(subject_id_temp, camera_temp)
@@ -1634,9 +1833,11 @@ def main():
         help='Number of subject-camera pairs to process in parallel. Use 1 for sequential processing.',
     )
     parser.add_argument(
-        '--within-job-workers', type=int, default=1, dest='within_job_workers',
-        help='Number of parallel workers for frame-group processing within one subject-camera pair. '
-             'Default 1 (sequential). Higher values parallelize mask I/O but may saturate disk.',
+        '--within-job-workers', type=int, default=DEFAULT_WITHIN_JOB_WORKERS, dest='within_job_workers',
+        help='Number of parallel worker processes for frame scoring within one subject-camera pair '
+             '(1 = sequential). Automatically capped so that --num-workers x this value does not '
+             'exceed the CPUs available to this process. Higher values parallelize mask I/O but '
+             'may saturate disk.',
     )
     parser.add_argument(
         '--pipeline',
@@ -1649,6 +1850,12 @@ def main():
              'sam2_ui.py, de-duplicated against SAM3-derived/covered ids via sam2_handoff.json.',
     )
     parser.add_argument('--skip-figures', action='store_true', help='Skip trajectory and confidence heatmap figure generation.')
+    parser.add_argument(
+        '--vector-figures', action='store_true', dest='vector_figures',
+        help='Keep the per-sample trajectory and heatmap as vector graphics in the PDFs. By default '
+             'they are rasterized at 300 dpi inside the PDF (axes and text stay vector), which is '
+             'much smaller and faster for long recordings.',
+    )
     parser.add_argument(
         '--start-plot-time',
         type=float,
@@ -1753,6 +1960,13 @@ def main():
         args.log_path = os.path.join(args.output_dir, 'gaze_object.log')
     log_path = Path(args.log_path)
     use_queue_logging = args.num_workers > 1 and len(subject_camera_pairs) > 1
+
+    # Keep (concurrent pairs) x (frame workers per pair) within the available CPUs.
+    # More processes than CPUs would still run correctly, just slower and with more RAM.
+    concurrent_pairs = min(args.num_workers, len(subject_camera_pairs)) if use_queue_logging else 1
+    within_job_cap = max(1, _available_cpus() // max(1, concurrent_pairs))
+    requested_within_job_workers = args.within_job_workers
+    args.within_job_workers = min(args.within_job_workers, within_job_cap)
     log_queue, log_listener, log_manager = setup_logging(log_path, use_queue=use_queue_logging)
 
     try:
@@ -1774,6 +1988,13 @@ def main():
         logger.info(f"Plot Figures: {not args.skip_figures}")
         logger.info(f"Num Workers: {args.num_workers}")
         logger.info(f"Within-Job Workers: {args.within_job_workers}")
+        if args.within_job_workers < requested_within_job_workers:
+            logger.info(
+                f"Within-job workers reduced from {requested_within_job_workers} to "
+                f"{args.within_job_workers}: {_available_cpus()} CPU(s) available for "
+                f"{concurrent_pairs} concurrent subject-camera pair(s)."
+            )
+        logger.info(f"Vector Figures: {args.vector_figures}")
         logger.info(f"Gaze Confidence Threshold: {args.gaze_confidence_threshold}")
         logger.info(f"Category Sort: {args.category_sort}")
         logger.info(f"Gaze Radius (px): {args.gaze_radius}")
@@ -1803,6 +2024,7 @@ def main():
                     gaze_confidence_threshold=args.gaze_confidence_threshold,
                     gaze_radius=args.gaze_radius,
                     pipeline=args.pipeline,
+                    vector_figures=args.vector_figures,
                 )
                 gaze_aligner.process_subject(subj, cam)
                 logger.info(f"------- Finished processing subject {subj}, camera {cam} -------")
@@ -1830,6 +2052,7 @@ def main():
                     args.gaze_radius,
                     log_queue,
                     args.pipeline,
+                    args.vector_figures,
                 )
                 for subj, cam in subject_camera_pairs
             ]
