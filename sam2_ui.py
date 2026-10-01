@@ -7784,6 +7784,24 @@ class SAM2VideoUI:
         if cache_key in self.mask_cache:
             return self.mask_cache[cache_key]
 
+        # SAM2 covered-by-SAM3 IDs: mask is the pixel-wise union of the referenced
+        # SAM3 sub-instance masks (mirrors sam2_process.py covered-union computation).
+        covered_info = self.sam2_covered_ids.get(obj_id)
+        if covered_info is not None:
+            sub_ids = [int(s) for s in covered_info.get("sam3_sub_ids", [])]
+            union = None
+            for sub_id in sub_ids:
+                sub_mask = self._load_mask(frame_idx, sub_id)
+                if sub_mask is None:
+                    continue
+                sub_bin = (sub_mask > 0)
+                union = sub_bin if union is None else (union | sub_bin)
+            if union is None:
+                return None
+            mask = (union.astype(np.uint8) * 255)
+            self._cache_mask(cache_key, mask)
+            return mask
+
         # Check SAM3 native mask paths first
         if obj_id in self.sam3_mask_dirs:
             mask_dir, pattern = self.sam3_mask_dirs[obj_id]

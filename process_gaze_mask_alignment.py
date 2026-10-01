@@ -142,34 +142,143 @@ def _load_sam3_masks_for_frame(
     return masks
 
 
+def _sam2_mask_labels(name: str) -> set:
+    """Normalized labels that can match a SAM2-style mask filename / npz key.
+
+    Mirrors GazeObjectAligner.mask_labels so module-level workers can filter without
+    an aligner instance.
+    """
+    filename = os.path.basename(name)
+    stem = os.path.splitext(filename)[0]
+    parts = stem.split('_')
+    labels = {_normalize_label(filename), _normalize_label(stem)}
+    if len(parts) >= 4 and parts[0] == "mask" and parts[1].startswith("f"):
+        object_name = '_'.join(parts[2:-1])
+        object_id = parts[-1]
+        labels.add(_normalize_label(object_name))
+        labels.add(_normalize_label(object_id))
+        if object_id.startswith("id"):
+            labels.add(object_id[2:])
+    return labels
+
+
+def _load_sam2_masks_for_frame(
+    mask_dir: str,
+    frame_idx: int,
+    ignore_labels: set = None,
+    exclude_id_labels: set = None,
+) -> dict:
+    """Load SAM2-style masks for one frame (per-frame NPZ, else per-object PNGs).
+
+    Args:
+        mask_dir: Directory holding ``masks_f{frame:06d}.npz`` or ``*mask_f{frame:06d}*.png``.
+        ignore_labels: Normalized labels (from --ignore-object-list) - any mask whose
+            labels intersect this set is skipped.
+        exclude_id_labels: Normalized id tokens (e.g. ``{"id5", "5"}``) - masks with a
+            matching object id are skipped. Used in ``pipeline=both`` to drop SAM2 masks
+            that are really SAM3 instances linked/unioned by sam2_process.py.
+
+    Returns:
+        Dict mapping mask filename (npz keys get a ``.png`` suffix, matching legacy
+        behaviour) to (H, W) uint8 binary arrays.
+    """
+    frame_id_str = f"{frame_idx:06d}"
+
+    def _skip(name: str) -> bool:
+        labels = _sam2_mask_labels(name)
+        if ignore_labels and (labels & ignore_labels):
+            return True
+        if exclude_id_labels and (labels & exclude_id_labels):
+            return True
+        return False
+
+    npz_path = Path(mask_dir) / f"masks_f{frame_id_str}.npz"
+    masks = {}
+    if npz_path.exists():
+        data = np.load(str(npz_path))
+        for k in data.files:
+            key = k + ".png"
+            if _skip(key):
+                continue
+            masks[key] = (data[k] > 0).astype(np.uint8)
+    else:
+        pattern = os.path.join(mask_dir, f"*mask_f{frame_id_str}*.png")
+        for mask_path in sorted(glob.glob(pattern)):
+            if _skip(os.path.basename(mask_path)):
+                continue
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            if mask is not None:
+                masks[os.path.basename(mask_path)] = np.where(mask > 0, 1, 0).astype(np.uint8)
+    return masks
+
+
+def _sam2_native_masks_dir(project_dir) -> Optional[Path]:
+    """Return the SAM2 results masks/ dir inside a converted SAM3 project, or None.
+
+    Reads ``sam2_results_subdir`` from sam2_handoff.json (default ``sam2_results``).
+    """
+    project_dir = Path(project_dir)
+    subdir = "sam2_results"
+    handoff = project_dir / "sam2_handoff.json"
+    if handoff.exists():
+        try:
+            with open(handoff) as f:
+                subdir = json.load(f).get("sam2_results_subdir", subdir)
+        except Exception:
+            pass
+    candidate = project_dir / subdir / "masks"
+    return candidate if candidate.is_dir() else None
+
+
+def _read_handoff_sam3_derived_id_labels(project_dir) -> set:
+    """Normalized id tokens for every SAM2 object in sam2_handoff.json that is actually a
+    SAM3 instance (object_mapping) or a covered-union (sam2_covered_ids).
+
+    Used by ``pipeline=both`` to avoid double-counting: those SAM2 masks in
+    sam2_results/masks/ are dropped in favour of the canonical SAM3 hierarchy masks.
+    """
+    project_dir = Path(project_dir)
+    handoff = project_dir / "sam2_handoff.json"
+    labels: set = set()
+    if not handoff.exists():
+        return labels
+    try:
+        with open(handoff) as f:
+            data = json.load(f)
+    except Exception:
+        return labels
+    for key_group in (data.get("object_mapping", {}), data.get("sam2_covered_ids", {})):
+        for sam2_id in key_group:
+            labels.add(_normalize_label(f"id{sam2_id}"))
+            labels.add(_normalize_label(str(sam2_id)))
+    return labels
+
+
 def _frame_group_worker(args):
     """Worker: load masks for one frame, score all gaze points, return partial probabilities.
 
-    args is a 4- or 5-tuple:
-        (frame_idx, gaze_points, mask_dir, r)                        # SAM2 mode
-        (frame_idx, gaze_points, project_dir, r, sam3_instances)     # SAM3 mode
+    args is a 4- to 6-tuple:
+        (frame_idx, gaze_points, mask_dir, r)                              # SAM2 mode
+        (frame_idx, gaze_points, project_dir, r, sam3_instances)           # SAM3 mode
+        (frame_idx, gaze_points, project_dir, r, sam3_instances, sam2_extra)  # both mode
+    where sam2_extra = (sam2_masks_dir, exclude_id_labels, ignore_labels) or None.
     """
     frame_idx, gaze_points, mask_dir, r = args[:4]
     sam3_instances = args[4] if len(args) > 4 else None
+    sam2_extra = args[5] if len(args) > 5 else None
     disk = _disk_template(r)
-    frame_id_str = f"{frame_idx:06d}"
 
     if sam3_instances is not None:
         # SAM3 mode: masks live under concepts/<concept>/instances/<id>/masks/
         masks = _load_sam3_masks_for_frame(mask_dir, frame_idx, sam3_instances)
+        if sam2_extra is not None:
+            # both mode: add SAM2-native objects, minus SAM3-derived / covered ids.
+            s2_dir, exclude_id_labels, ignore_labels = sam2_extra
+            masks.update(_load_sam2_masks_for_frame(
+                s2_dir, frame_idx, set(ignore_labels), set(exclude_id_labels)))
     else:
-        # SAM2 mode: try per-frame NPZ first, then individual PNG files
-        npz_path = Path(mask_dir) / f"masks_f{frame_id_str}.npz"
-        if npz_path.exists():
-            data = np.load(str(npz_path))
-            masks = {k + ".png": (data[k] > 0).astype(np.uint8) for k in data.files}
-        else:
-            pattern = os.path.join(mask_dir, f"*mask_f{frame_id_str}*.png")
-            masks = {}
-            for mask_path in sorted(glob.glob(pattern)):
-                mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-                if mask is not None:
-                    masks[os.path.basename(mask_path)] = np.where(mask > 0, 1, 0).astype(np.uint8)
+        # SAM2 mode
+        masks = _load_sam2_masks_for_frame(mask_dir, frame_idx)
 
     if not masks:
         return {}, False
@@ -369,7 +478,12 @@ class GazeObjectAligner:
         category_sort: str = "first_seen",
         gaze_confidence_threshold: float = 0.5,
         gaze_radius: int = 20,
+        pipeline: str = "auto",
     ):
+        # pipeline: "auto" (SAM3 if project.json else SAM2), "sam3" (SAM3 instances only),
+        # "sam2" (SAM2 masks only; for a converted project uses sam2_results/masks/),
+        # "both" (SAM3 instances + SAM2-native objects, de-duplicated via sam2_handoff.json)
+        self.pipeline = pipeline
         self.gaze_world_dir = gaze_world_dir
         self.gaze_csv_path = gaze_csv_path
         self.world_csv_path = world_csv_path
@@ -1083,9 +1197,38 @@ class GazeObjectAligner:
             unique_post_blink_frames = int(gaze_blink_removed["frame_idx"].nunique())
             mask_subject = self.resolve_mask_dir(subject_id_temp, camera_temp)
 
-            # Detect SAM3 vs SAM2 and load SAM3 instance list if needed
+            # Detect SAM3 vs SAM2 and apply the requested pipeline.
             is_sam3 = self._is_sam3_project(mask_subject)
             sam3_instances = None
+            sam2_extra = None  # set for pipeline="both": (sam2_masks_dir, exclude_ids, ignore)
+
+            if self.pipeline == "sam3" and not is_sam3:
+                raise FileNotFoundError(
+                    f"--pipeline sam3 requires a SAM3 project (project.json) at {mask_subject}")
+
+            if self.pipeline in ("sam2", "both") and is_sam3:
+                s2_dir = _sam2_native_masks_dir(mask_subject)
+                if self.pipeline == "sam2":
+                    if s2_dir is None:
+                        raise FileNotFoundError(
+                            f"--pipeline sam2: no SAM2 results (sam2_results/masks/) under {mask_subject}. "
+                            f"Run sam2_process.py on sam2_handoff.json first.")
+                    self.logger.info("pipeline=sam2: using SAM2-native masks at %s", s2_dir)
+                    is_sam3 = False
+                    mask_subject = s2_dir
+                else:  # both
+                    if s2_dir is None:
+                        self.logger.warning(
+                            "pipeline=both: no SAM2 results under %s; scoring SAM3 instances only.",
+                            mask_subject)
+                    else:
+                        exclude_ids = _read_handoff_sam3_derived_id_labels(mask_subject)
+                        sam2_extra = (str(s2_dir), sorted(exclude_ids), sorted(self.ignore_objects))
+                        self.logger.info(
+                            "pipeline=both: SAM3 instances + SAM2-native masks at %s "
+                            "(excluding %d SAM3-derived/covered id label(s)).",
+                            s2_dir, len(exclude_ids))
+
             if is_sam3:
                 sam3_instances = self.load_sam3_project_info(mask_subject)
                 # Apply ignore_objects filtering at instance level
@@ -1111,6 +1254,17 @@ class GazeObjectAligner:
                 category_display_map = {}
 
             mask_summary = self.summarize_mask_frames(mask_subject)
+            if sam2_extra is not None:
+                # both mode: a frame counts as covered if either source has it.
+                s2_summary = self._summarize_sam2_mask_frames(Path(sam2_extra[0]))
+                merged_ids = mask_summary["frame_ids"] | s2_summary["frame_ids"]
+                mask_summary = {
+                    "count": len(merged_ids),
+                    "frame_ids": merged_ids,
+                    "contiguous": sorted(merged_ids) == list(range(min(merged_ids), max(merged_ids) + 1)) if merged_ids else False,
+                    "min_frame": min(merged_ids) if merged_ids else None,
+                    "max_frame": max(merged_ids) if merged_ids else None,
+                }
             post_blink_frame_ids = set(gaze_blink_removed["frame_idx"].astype(int).unique())
             post_blink_missing_mask_frames = sorted(post_blink_frame_ids.difference(mask_summary["frame_ids"]))
 
@@ -1204,7 +1358,9 @@ class GazeObjectAligner:
                         (i, int(round(gdf.loc[i, 'gaze x [px]'])), int(round(gdf.loc[i, 'gaze y [px]'])))
                         for i in gdf.index
                     ]
-                    if is_sam3:
+                    if is_sam3 and sam2_extra is not None:
+                        frame_groups.append((int(frame_idx), gaze_points, str(mask_subject), _r, sam3_instances, sam2_extra))
+                    elif is_sam3:
                         frame_groups.append((int(frame_idx), gaze_points, str(mask_subject), _r, sam3_instances))
                     else:
                         frame_groups.append((int(frame_idx), gaze_points, str(mask_subject), _r))
@@ -1343,6 +1499,7 @@ def process_subject_camera_pair(args):
         gaze_confidence_threshold,
         gaze_radius,
         log_queue,
+        pipeline,
     ) = args
 
     setup_worker_logging(log_queue)
@@ -1364,6 +1521,7 @@ def process_subject_camera_pair(args):
         category_sort=category_sort,
         gaze_confidence_threshold=gaze_confidence_threshold,
         gaze_radius=gaze_radius,
+        pipeline=pipeline,
     )
     logger.info("Processing started.")
     gaze_aligner.process_subject(subject_id_temp, camera_temp)
@@ -1479,6 +1637,16 @@ def main():
         '--within-job-workers', type=int, default=1, dest='within_job_workers',
         help='Number of parallel workers for frame-group processing within one subject-camera pair. '
              'Default 1 (sequential). Higher values parallelize mask I/O but may saturate disk.',
+    )
+    parser.add_argument(
+        '--pipeline',
+        choices=['auto', 'sam3', 'sam2', 'both'],
+        default='auto',
+        help='Which segmentation pipeline(s) to score gaze against. "auto" (default): SAM3 if '
+             'the resolved mask dir is a SAM3 project (project.json), else SAM2. "sam3": SAM3 '
+             'instances only. "sam2": SAM2 masks only - for a converted SAM3 project this reads '
+             'sam2_results/masks/. "both": SAM3 instances plus SAM2-native objects added in '
+             'sam2_ui.py, de-duplicated against SAM3-derived/covered ids via sam2_handoff.json.',
     )
     parser.add_argument('--skip-figures', action='store_true', help='Skip trajectory and confidence heatmap figure generation.')
     parser.add_argument(
@@ -1597,6 +1765,7 @@ def main():
         logger.info(f"Subjects: {subj_ids}, Cameras: {camera_list}")
         logger.info(f"Gaze Directory: {args.gaze_world_dir}")
         logger.info(f"Mask Directory: {args.mask_dir}")
+        logger.info(f"Pipeline: {args.pipeline}")
         logger.info(f"Output Directory: {args.output_dir}")
         logger.info(f"Blink Directory: {args.blink_dir}")
         logger.info(f"Ignore Object List: {args.ignore_object_list}")
@@ -1633,6 +1802,7 @@ def main():
                     category_sort=args.category_sort,
                     gaze_confidence_threshold=args.gaze_confidence_threshold,
                     gaze_radius=args.gaze_radius,
+                    pipeline=args.pipeline,
                 )
                 gaze_aligner.process_subject(subj, cam)
                 logger.info(f"------- Finished processing subject {subj}, camera {cam} -------")
@@ -1659,6 +1829,7 @@ def main():
                     args.gaze_confidence_threshold,
                     args.gaze_radius,
                     log_queue,
+                    args.pipeline,
                 )
                 for subj, cam in subject_camera_pairs
             ]

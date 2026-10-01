@@ -119,6 +119,38 @@ def _write_mask(dst_path, mask, cv2_mod):
         cv2_mod.imwrite(str(dst_path), mask)
 
 
+def _make_merged_mask_loader(masks_dir, masks_by_frame):
+    """Return a load_mask_func(frame_idx, obj_id) that reads from ``masks_dir`` using
+    the filename recorded in ``masks_by_frame[frame_idx][obj_id]``.
+
+    Handles both per-frame stacked NPZ (``npz_key``) and per-object NPZ / covered-union
+    NPZ (which store the array under the plain ``mask`` key), plus PNG. Used to
+    recompute quality metrics over the full merged mask set (SAM2 + SAM3 links +
+    covered unions) after all merging has happened.
+    """
+    masks_dir = Path(masks_dir)
+
+    def _loader(frame_idx, obj_id):
+        obj_data = masks_by_frame.get(frame_idx, {}).get(obj_id)
+        if obj_data is None:
+            return None
+        mask_path = masks_dir / obj_data["filename"]
+        if obj_data["filename"].endswith(".npz"):
+            try:
+                d = np.load(str(mask_path))
+                k = obj_data.get("npz_key", "")
+                if k not in d.files and "mask" in d.files:
+                    # Per-object NPZ (SAM3 link / covered-union) uses key 'mask'
+                    k = "mask"
+                return (d[k] > 0).astype(np.uint8) * 255 if k in d.files else None
+            except Exception:
+                return None
+        m = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        return (m > 0).astype(np.uint8) * 255 if m is not None else None
+
+    return _loader
+
+
 def _link_sam3_masks_to_output(sam3_project, sam3_mask_dirs_rel, obj_ids,
                                 output_dir, num_frames, mask_format="png"):
     """
@@ -1573,6 +1605,9 @@ Examples:
                        help="Directory with previous segmentation results to reuse masks from (used with --only-updated). Defaults to the output directory.")
     parser.add_argument("--sam3-project", type=str, default=None,
                        help="Path to SAM3 project directory. Required when the annotation file references SAM3 objects and processing runs on a different machine from where annotations were created.")
+    parser.add_argument("--no-final-quality-recompute", action="store_true",
+                       dest="no_final_quality_recompute",
+                       help="Skip the end-of-run quality-metrics recompute over the full merged mask set (--only-updated / SAM3-linked / covered-union). quality_metrics.npz then covers only SAM2-propagated objects.")
     parser.add_argument("--video-only", action="store_true",
                        help="Skip segmentation entirely; create/recreate the output video from existing masks in the output directory.")
     parser.add_argument("--exclusive-masks", action="store_true", dest="exclusive_masks",
@@ -1834,14 +1869,27 @@ Examples:
     frame_dir_used = None
     is_persistent = False
 
+    # Quality metrics recompute: whenever masks that process_segmentation does NOT score
+    # during propagation end up in the final set - reused --only-updated masks, SAM3-linked
+    # instances, or SAM2 covered-union masks - recompute the metrics over the full merged
+    # set at the end. Plain SAM2 runs skip this and keep the cheaper incremental metrics.
+    # SAM3-linked / covered-union masks only get merged into masks_by_frame when a
+    # --sam3-project is available to read the native masks from.
+    _sam3_will_merge = bool(
+        (sam3_obj_ids or sam2_covered_ids) and sam3_project and sam3_mask_dirs_rel
+    )
+    _will_recompute_quality = bool(
+        unchanged_ids or _sam3_will_merge
+    ) and not args.no_final_quality_recompute
+
     try:
         # Process segmentation
-        # Skip the intermediate quality metrics save when --only-updated has unchanged objects:
-        # those objects' masks aren't included in this run, so the metrics would be misleading.
-        # The merged quality metrics are calculated below after reusing unchanged masks.
+        # Skip the intermediate quality metrics save when we will recompute over the full
+        # merged set below: the partial metrics from propagation would otherwise be written
+        # and then immediately overwritten (and are misleading in the meantime).
         result = processor.process_segmentation(
             args.video_file, annotations_data, output_dir, frame_dir=args.frame_dir,
-            skip_quality_save=bool(unchanged_ids),
+            skip_quality_save=_will_recompute_quality,
             unchanged_ids=unchanged_ids if unchanged_ids else None,
         )
         masks_by_frame, object_names, object_colors, num_frames, frame_dir_used, is_persistent = result
@@ -1852,6 +1900,7 @@ Examples:
 
         print(f"\nOK: Generated masks for {len(masks_by_frame)} frames")
 
+        _unchanged_merge_ok = False
         # --only-updated: merge unchanged masks from prev_results into masks_by_frame
         if unchanged_ids and prev_results_dir is not None:
             prev_masks_dir = prev_results_dir / "masks"
@@ -1915,34 +1964,9 @@ Examples:
                 for oid, name in prev_names.items():
                     object_names[str(oid)] = name
                 print(f"Reused masks for unchanged objects {sorted(unchanged_ids)} from {prev_masks_dir}")
-
-                # Re-calculate quality metrics with all objects (updated + unchanged).
-                # The metrics saved inside process_segmentation only cover updated objects.
-                print("Re-calculating quality metrics with all objects (updated + unchanged)...")
-                _merged_masks_dir = output_dir / "masks"
-                def _load_merged_mask(frame_idx, obj_id):
-                    obj_data = masks_by_frame.get(frame_idx, {}).get(obj_id)
-                    if obj_data is None:
-                        return None
-                    mask_path = _merged_masks_dir / obj_data['filename']
-                    if obj_data['filename'].endswith('.npz'):
-                        try:
-                            d = np.load(str(mask_path))
-                            k = obj_data.get('npz_key', '')
-                            if k not in d.files and 'mask' in d.files:
-                                # Per-object NPZ (SAM3 link / covered-union) uses key 'mask'
-                                k = 'mask'
-                            return (d[k] > 0).astype(np.uint8) * 255 if k in d.files else None
-                        except Exception:
-                            return None
-                    m = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-                    return (m > 0).astype(np.uint8) * 255 if m is not None else None
-                from utils import calculate_quality_metrics
-                _inter, _bg, _overlap = calculate_quality_metrics(
-                    masks_by_frame, _load_merged_mask, (height, width), num_frames
-                )
-                save_quality_metrics(str(output_dir), _inter, _bg, _overlap)
-                print("OK: Re-saved quality metrics with all objects")
+                _unchanged_merge_ok = True
+                # Quality metrics for the merged set are recomputed once below, after SAM3
+                # links and covered-union masks have also been added to masks_by_frame.
             else:
                 print(f"WARNING: No masks found in {prev_masks_dir} for unchanged objects {sorted(unchanged_ids)}")
 
@@ -2003,6 +2027,26 @@ Examples:
                 else:
                     print(f"  WARNING: No sub-id masks found for covered '{covered_name}' "
                           f"(id {covered_id}). Sub-ids: {sub_ids}")
+
+        # Recompute quality metrics over the full merged mask set (SAM2-propagated +
+        # --only-updated reused + SAM3-linked instances + SAM2 covered-union masks).
+        # Gated by _will_recompute_quality so plain SAM2 runs keep the incremental metrics.
+        _do_quality_recompute = _will_recompute_quality and (
+            _sam3_will_merge or _unchanged_merge_ok
+        )
+        if _do_quality_recompute:
+            print("Recalculating quality metrics over all objects "
+                  "(SAM2 + SAM3 + covered unions)...")
+            from utils import calculate_quality_metrics
+            _quality_loader = _make_merged_mask_loader(output_dir / "masks", masks_by_frame)
+            _inter, _bg, _overlap = calculate_quality_metrics(
+                masks_by_frame, _quality_loader, (height, width), num_frames
+            )
+            save_quality_metrics(str(output_dir), _inter, _bg, _overlap)
+            print("OK: Saved quality metrics for all objects")
+        elif _sam3_will_merge and args.no_final_quality_recompute:
+            print("NOTE: --no-final-quality-recompute set; quality_metrics.npz covers only "
+                  "SAM2-propagated objects, not SAM3/covered-union masks.")
 
         # Export results
         processor.export_masks(masks_by_frame, args.video_file, object_names, output_dir)
