@@ -411,12 +411,16 @@ This script:
     1) Resolves the mask source using three fallback strategies (see resolve_mask_dir).
     2) Loads *{subject_id}_{camera}_gaze.csv* and
        *{subject_id}_{camera}_world_timestamps.csv* from the gaze/world directory.
-    3) Aligns each gaze timestamp to the most recent world-camera frame at or
-       before that timestamp.
+    3) Aligns each gaze timestamp to the world-camera frame with the nearest
+       timestamp (a frame owns the samples between the midpoints to its neighbours).
+       Samples more than half a frame interval before the first frame or after the
+       last frame are dropped.
     4) Optionally labels blinks from *{subject_id}_{camera}_blinks.csv* and
        removes blink-period gaze samples from the object-assignment stage.
     5) Scores each aligned gaze sample against all readable masks in the matched
-       frame and assigns the highest-confidence object label.
+       frame and assigns the highest-confidence object label. With
+       --gaze-aggregate mean/median, the samples of each frame are first collapsed
+       into one gaze point and one label is assigned per frame instead.
     6) Saves the per-gaze object assignments, a pickle of per-mask confidence
        values, and method-figure trajectory/heatmap plots.
 
@@ -483,6 +487,12 @@ Outputs:
         figures/
           {subject_id}_{camera}_trajectory_plot.{png,pdf}
           {subject_id}_{camera}_confidence_heatmap.{png,pdf}
+        With --gaze-aggregate mean/median, the gazed_object CSV, probabilities pkl and
+        figures get a _per_frame_{mean,median} suffix (before any
+        _excluding_ignored_objects suffix). The CSV then has one row per world frame
+        with frame_idx, [source_frame_idx], frame timestamp [ns], gaze x/y [px]
+        (aggregated), n_gaze_samples, gaze_aggregate and the gazed_object columns;
+        the pkl is keyed by frame_idx instead of gaze row.
 
     2) A log file is written to *--log-path* if provided, otherwise to
        *{output_dir}/gaze_object.log*.
@@ -584,7 +594,12 @@ class GazeObjectAligner:
         gaze_radius: int = 20,
         pipeline: str = "auto",
         vector_figures: bool = False,
+        gaze_aggregate: str = "none",
     ):
+        # gaze_aggregate: "none" scores every gaze sample (one output row per gaze sample);
+        # "mean"/"median" collapse each frame's gaze samples into one gaze point (one output
+        # row per world-camera frame, written to separately named *_per_frame_<mode> files).
+        self.gaze_aggregate = gaze_aggregate
         # vector_figures: keep the dense heatmap/trajectory as vector graphics in the PDF
         # (exact, but large and slow for long recordings). Default rasterizes them.
         self.vector_figures = vector_figures
@@ -656,6 +671,10 @@ class GazeObjectAligner:
     def excluded_objects_output_suffix(self):
         """Label outputs that were generated after excluding ignored objects."""
         return "_excluding_ignored_objects" if self.ignore_objects else ""
+
+    def gaze_aggregate_output_suffix(self):
+        """Label per-frame (aggregated) outputs so they never mix with per-sample outputs."""
+        return "" if self.gaze_aggregate == "none" else f"_per_frame_{self.gaze_aggregate}"
 
     # ------------------------------------------------------------------
     # SAM3 project helpers
@@ -1150,8 +1169,8 @@ class GazeObjectAligner:
         trajectory_ax.grid(axis="x", linestyle="--", alpha=0.35)
         trajectory_fig.tight_layout()
 
-        trajectory_png = figures_dir / f"{subject_id_temp}_{camera_temp}_trajectory_plot.png"
-        trajectory_pdf = figures_dir / f"{subject_id_temp}_{camera_temp}_trajectory_plot.pdf"
+        trajectory_png = figures_dir / f"{subject_id_temp}_{camera_temp}_trajectory_plot{self.gaze_aggregate_output_suffix()}.png"
+        trajectory_pdf = figures_dir / f"{subject_id_temp}_{camera_temp}_trajectory_plot{self.gaze_aggregate_output_suffix()}.pdf"
         trajectory_fig.savefig(trajectory_png, dpi=300, bbox_inches="tight")
         trajectory_fig.savefig(trajectory_pdf, dpi=pdf_dpi, bbox_inches="tight")
         plt.close(trajectory_fig)
@@ -1180,8 +1199,8 @@ class GazeObjectAligner:
         cbar.set_label("Confidence")
         heatmap_fig.tight_layout()
 
-        heatmap_png = figures_dir / f"{subject_id_temp}_{camera_temp}_confidence_heatmap.png"
-        heatmap_pdf = figures_dir / f"{subject_id_temp}_{camera_temp}_confidence_heatmap.pdf"
+        heatmap_png = figures_dir / f"{subject_id_temp}_{camera_temp}_confidence_heatmap{self.gaze_aggregate_output_suffix()}.png"
+        heatmap_pdf = figures_dir / f"{subject_id_temp}_{camera_temp}_confidence_heatmap{self.gaze_aggregate_output_suffix()}.pdf"
         heatmap_fig.savefig(heatmap_png, dpi=300, bbox_inches="tight")
         heatmap_fig.savefig(heatmap_pdf, dpi=pdf_dpi, bbox_inches="tight")
         plt.close(heatmap_fig)
@@ -1238,6 +1257,11 @@ class GazeObjectAligner:
         Select gaze data within the cut video duration.
         Label each gaze with the corresponding frame id in the cut video.
 
+        Each gaze sample is assigned to the frame with the nearest timestamp, i.e. frame k owns
+        the samples between the midpoints to its neighbouring frames. The first/last frame's
+        window extends outwards by half its adjacent frame interval; samples beyond that
+        (before the video starts or after it ends) are dropped.
+
         Args:
             subj (str): The subject identifier.
             camera (str): The camera identifier.
@@ -1279,11 +1303,46 @@ class GazeObjectAligner:
             world_cam_dic,
             left_on="timestamp [ns]",
             right_on="timestamp [ns]",
-            direction="backward",        # <= gaze time (closest before)
+            direction="nearest",         # closest frame on either side (midpoint windows)
             allow_exact_matches=True
         )
         aligned = aligned.dropna(subset=['frame_idx'])
+        if len(world_cam_dic) >= 2:
+            frame_ts = world_cam_dic['timestamp [ns]'].to_numpy(dtype=float)
+            lo = frame_ts[0] - (frame_ts[1] - frame_ts[0]) / 2.0
+            hi = frame_ts[-1] + (frame_ts[-1] - frame_ts[-2]) / 2.0
+            gaze_ts = aligned['timestamp [ns]'].to_numpy(dtype=float)
+            outside = (gaze_ts < lo) | (gaze_ts > hi)
+            if outside.any():
+                self.logger.info(
+                    "Dropped %d gaze sample(s) more than half a frame before the first or "
+                    "after the last world frame", int(outside.sum()))
+                aligned = aligned.loc[~outside]
         return aligned, world_cam_dic, world_cam_path
+
+    def aggregate_gaze_per_frame(self, gaze_df: pd.DataFrame, world_cam_dic: pd.DataFrame) -> pd.DataFrame:
+        """Collapse the gaze samples of each world frame into one gaze point (mean or median).
+
+        Returns one row per frame in the world CSV, indexed by frame_idx, with the frame's own
+        timestamp as 'frame timestamp [ns]', the aggregated gaze x/y and n_gaze_samples. Samples
+        with NaN coordinates are ignored; frames with no usable samples (e.g. all in a blink)
+        get NaN x/y and n_gaze_samples = 0, and are left unlabelled.
+        """
+        keep_cols = ['frame_idx', 'timestamp [ns]'] + (
+            ['source_frame_idx'] if 'source_frame_idx' in world_cam_dic.columns else [])
+        frames = world_cam_dic[keep_cols].rename(columns={'timestamp [ns]': 'frame timestamp [ns]'})
+        frames['frame_idx'] = frames['frame_idx'].astype(int)
+        frames = frames.set_index('frame_idx', drop=False).sort_index()
+        frames.index.name = None
+
+        xy_cols = ['gaze x [px]', 'gaze y [px]']
+        valid = gaze_df.dropna(subset=xy_cols)
+        grouped = valid.groupby(valid['frame_idx'].astype(int))[xy_cols]
+        agg = grouped.mean() if self.gaze_aggregate == "mean" else grouped.median()
+        frames[xy_cols] = agg.reindex(frames.index)
+        frames['n_gaze_samples'] = grouped.size().reindex(frames.index, fill_value=0).astype(int)
+        frames['gaze_aggregate'] = self.gaze_aggregate
+        return frames
 
     def label_blinks(self, aligned_gaze_df: pd.DataFrame, subj: str, camera: str) -> pd.DataFrame:
         """Label each gaze point with blink information, whether they are in blink periods."""
@@ -1489,17 +1548,29 @@ class GazeObjectAligner:
                     preview,
                 )
 
+            # scored_df holds the rows that get an object label: one per gaze sample, or with
+            # --gaze-aggregate mean/median one per world frame (keyed by frame_idx).
+            if self.gaze_aggregate == "none":
+                scored_df = gaze_blink_removed
+                row_unit = "gaze_points"
+            else:
+                scored_df = self.aggregate_gaze_per_frame(gaze_blink_removed, world_cam_dic)
+                row_unit = "frames"
+                self.logger.info(
+                    "Aggregated gaze per frame (%s): %d world frames, %d with >= 1 gaze sample",
+                    self.gaze_aggregate, len(scored_df), int((scored_df['n_gaze_samples'] > 0).sum()))
+
             subject_gaze_probabilities = {}
-            total_gaze_points = len(gaze_blink_removed)
+            total_gaze_points = len(scored_df)
             total_frames = unique_post_blink_frames
             frames_with_masks = 0
             frames_without_masks = 0
-            gaze_blink_removed['gazed_object_id'] = None
-            gaze_blink_removed['gazed_object'] = None
-            gaze_blink_removed['gazed_object_confidence'] = 0.0
+            scored_df['gazed_object_id'] = None
+            scored_df['gazed_object'] = None
+            scored_df['gazed_object_confidence'] = 0.0
             _r = self.gaze_radius
 
-            excluded_objects_suffix = self.excluded_objects_output_suffix()
+            excluded_objects_suffix = self.gaze_aggregate_output_suffix() + self.excluded_objects_output_suffix()
             pkl_path = out_dir / f"{subject_id_temp}_{camera_temp}_gaze_object_probabilities{excluded_objects_suffix}.pkl"
             settings_path = pkl_path.with_name(pkl_path.stem + ".settings.json")
             # Everything that changes which scores the pkl holds. A cached pkl is only reused
@@ -1514,6 +1585,10 @@ class GazeObjectAligner:
                 # The world CSV decides which frame each gaze sample is scored against.
                 "world_csv": str(self._world_csv_path(subject_id_temp, camera_temp).resolve()),
                 "blink_dir": str(Path(self.blink_dir).resolve()) if self.blink_dir else None,
+                # How gaze samples map to frames. Caches from before this key used "backward"
+                # matching (frame at or before the sample) and must not be reused.
+                "frame_match": "nearest_midpoint",
+                "gaze_aggregate": self.gaze_aggregate,
             }
             _use_cached_pkl = not self.recompute and pkl_path.exists()
             if _use_cached_pkl:
@@ -1537,8 +1612,9 @@ class GazeObjectAligner:
                 elif stored_settings is None and _use_cached_pkl:
                     self.logger.warning(
                         "Cached probabilities at %s have no settings record (written by an older "
-                        "version), so radius/pipeline/ignore-list cannot be verified. Reusing them; "
-                        "pass --recompute if any of those changed.", pkl_path)
+                        "version that matched gaze to frames differently); recomputing from masks.",
+                        pkl_path)
+                    _use_cached_pkl = False
 
             if _use_cached_pkl:
                 self.logger.warning(
@@ -1558,7 +1634,9 @@ class GazeObjectAligner:
                     "sam2_extra": sam2_extra if is_sam3 else None,
                 }
                 frame_tasks = []
-                for frame_idx, gdf in gaze_blink_removed.groupby('frame_idx', sort=False):
+                # Rows without gaze coordinates (NaN samples, frames with no samples) stay unlabelled.
+                scorable = scored_df.dropna(subset=['gaze x [px]', 'gaze y [px]'])
+                for frame_idx, gdf in scorable.groupby('frame_idx', sort=False):
                     xs = gdf['gaze x [px]'].to_numpy()
                     ys = gdf['gaze y [px]'].to_numpy()
                     gaze_points = [
@@ -1594,7 +1672,7 @@ class GazeObjectAligner:
                             subject_gaze_probabilities.update(partial)
 
             assigned_confidences = self._assign_best_objects(
-                gaze_blink_removed, subject_gaze_probabilities)
+                scored_df, subject_gaze_probabilities)
             assigned_gaze_points = len(assigned_confidences)
 
             assignment_rate = (assigned_gaze_points / total_gaze_points * 100.0) if total_gaze_points > 0 else 0.0
@@ -1604,10 +1682,11 @@ class GazeObjectAligner:
             if _use_cached_pkl:
                 self.logger.info(
                     "Gaze-object assignment summary (from cached pkl) for subject=%s camera=%s: "
-                    "total_gaze_points=%d assigned=%d assignment_rate=%.2f%% "
+                    "total_%s=%d assigned=%d assignment_rate=%.2f%% "
                     "mean_conf=%.4f median_conf=%.4f",
                     subject_id_temp,
                     camera_temp,
+                    row_unit,
                     total_gaze_points,
                     assigned_gaze_points,
                     assignment_rate,
@@ -1618,12 +1697,13 @@ class GazeObjectAligner:
                 self.logger.info(
                     (
                         "Gaze-object assignment summary for subject=%s camera=%s: "
-                        "total_gaze_points=%d assigned=%d assignment_rate=%.2f%% "
+                        "total_%s=%d assigned=%d assignment_rate=%.2f%% "
                         "frames_with_readable_masks=%d/%d post_blink_frames "
                         "mean_conf=%.4f median_conf=%.4f"
                     ),
                     subject_id_temp,
                     camera_temp,
+                    row_unit,
                     total_gaze_points,
                     assigned_gaze_points,
                     assignment_rate,
@@ -1641,7 +1721,7 @@ class GazeObjectAligner:
                     )
 
             output_path = os.path.join(out_dir, f"{subject_id_temp}_{camera_temp}_gazed_object{excluded_objects_suffix}.csv")
-            gaze_blink_removed.to_csv(output_path, index=False)
+            scored_df.to_csv(output_path, index=False)
             self.logger.info(f"Saved gaze object results to {output_path}")
 
             if not _use_cached_pkl:
@@ -1652,10 +1732,16 @@ class GazeObjectAligner:
                 self.logger.info(f"Saved probabilities of each mask for each eye gaze to {pkl_path}")
 
             if self.plot_figures:
+                if self.gaze_aggregate == "none":
+                    plot_df = scored_df
+                else:
+                    # Plot only frames that had gaze, on the frame time axis.
+                    plot_df = scored_df.loc[scored_df['n_gaze_samples'] > 0].rename(
+                        columns={'frame timestamp [ns]': 'timestamp [ns]'})
                 self.plot_method_figures(
                     subject_id_temp=subject_id_temp,
                     camera_temp=camera_temp,
-                    gaze_df=gaze_blink_removed,
+                    gaze_df=plot_df,
                     subject_gaze_probabilities=subject_gaze_probabilities,
                     out_dir=out_dir,
                     category_display_map=category_display_map,
@@ -1698,6 +1784,7 @@ def process_subject_camera_pair(args):
         log_queue,
         pipeline,
         vector_figures,
+        gaze_aggregate,
     ) = args
 
     setup_worker_logging(log_queue)
@@ -1721,6 +1808,7 @@ def process_subject_camera_pair(args):
         gaze_radius=gaze_radius,
         pipeline=pipeline,
         vector_figures=vector_figures,
+        gaze_aggregate=gaze_aggregate,
     )
     logger.info("Processing started.")
     gaze_aligner.process_subject(subject_id_temp, camera_temp)
@@ -1898,6 +1986,17 @@ def main():
              'distinctions between nearby/adjacent objects. Default 20.',
     )
 
+    parser.add_argument(
+        '--gaze-aggregate',
+        choices=['none', 'mean', 'median'],
+        default='none',
+        help='"none" (default): score every gaze sample; output has one row per gaze sample. '
+             '"mean"/"median": collapse the gaze samples matched to each world frame (its '
+             'midpoint window, after blink removal) into one gaze point and score that; output '
+             'has one row per world frame, timed by "frame timestamp [ns]", with n_gaze_samples, '
+             'and is written to *_per_frame_<mode> files so it never overwrites per-sample output.',
+    )
+
     args = parser.parse_args()
 
     if args.num_workers < 1:
@@ -1998,6 +2097,7 @@ def main():
         logger.info(f"Gaze Confidence Threshold: {args.gaze_confidence_threshold}")
         logger.info(f"Category Sort: {args.category_sort}")
         logger.info(f"Gaze Radius (px): {args.gaze_radius}")
+        logger.info(f"Gaze Aggregate: {args.gaze_aggregate}")
         logger.info(f"Queue Logging: {use_queue_logging}")
         if args.blink_dir is None:
             logger.info("No blink directory provided, skipping blink labeling.")
@@ -2025,6 +2125,7 @@ def main():
                     gaze_radius=args.gaze_radius,
                     pipeline=args.pipeline,
                     vector_figures=args.vector_figures,
+                    gaze_aggregate=args.gaze_aggregate,
                 )
                 gaze_aligner.process_subject(subj, cam)
                 logger.info(f"------- Finished processing subject {subj}, camera {cam} -------")
@@ -2053,6 +2154,7 @@ def main():
                     log_queue,
                     args.pipeline,
                     args.vector_figures,
+                    args.gaze_aggregate,
                 )
                 for subj, cam in subject_camera_pairs
             ]
