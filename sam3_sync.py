@@ -3,10 +3,11 @@
 sam3_sync.py — push local annotation edits to a remote project directory.
 
 Copies only the small metadata/annotation files needed for --refine:
-  project.json, concept_metadata.json, refinements.json, redetect sentinels
+  project.json, concept_metadata.json, refinements.json, redetect sentinels,
+  mask_anchors/ (user-drawn anchor masks)
 
-Skips large server-generated data:
-  masks/, cond_states/, inference_state.pkl, video files, image files
+Skips large or server-generated data:
+  masks/, cond_states/, inference_state.pkl, obj_ptr_priors.npz, video files, frame images
 
 Usage:
     python sam3_sync.py <local_project_dir> <remote_dest>
@@ -24,14 +25,22 @@ Windows notes:
   If none are found, install one of the above or use WinSCP / MobaXterm as a GUI alternative.
 
 Manual rsync (if this script can't run in your environment):
-  This script runs the equivalent of:
-    rsync -av --update --chmod=Fg+rw,Fo+r,Dg+rwx,Do+rx \
-      --exclude '*/masks/' --exclude '*/cond_states/' --exclude 'inference_state.pkl' \
-      --exclude '*.mp4' --exclude '*.avi' --exclude '*.jpg' --exclude '*.jpeg' --exclude '*.png' \
+  The essential command is:
+    rsync -rtu --exclude masks/ --exclude cond_states/ \
+      --exclude inference_state.pkl --exclude obj_ptr_priors.npz \
+      --exclude '*.mp4' --exclude '*.avi' --exclude '*.jpg' \
       <local_project_dir>/ user@host:/path/to/project
-  The --chmod flag is important on a shared server: without it, files pushed from a
-  single-user machine (especially Windows, which has no real umask) can land
-  owner-only and become unreadable/unwritable by the rest of your group.
+  -u skips files that are newer on the server (e.g. updated there by --refine), and
+  -t keeps modification times so that comparison stays meaningful. The trailing /
+  on the source copies the folder's contents rather than nesting it.
+
+  Tip for shared group folders (several users, setgid directories): this script also
+  adds --chmod=Fg+rw,Fo+r,F-x,Dg+rwx,Do+rx so synced files stay group-writable, and
+  avoids -a. -a implies -p/-g, which copy the source's permissions and group; when
+  the source is Windows (no setgid, no matching Unix group), that strips setgid from
+  new server directories and later files there end up in the writer's personal group.
+  If your rsync is too old for --chmod, the script retries without it; then run
+  "chmod -R g+rw" on the server project afterwards.
 """
 
 import argparse
@@ -41,15 +50,17 @@ import subprocess
 import sys
 
 
+# No "*.png" here: user-drawn mask anchors live in instances/<id>/mask_anchors/*.png
+# and --refine needs them on the server. Propagated masks are covered by "masks/".
 EXCLUDES = [
-    "*/masks/",
-    "*/cond_states/",
+    "masks/",
+    "cond_states/",
     "inference_state.pkl",
+    "obj_ptr_priors.npz",
     "*.mp4",
     "*.avi",
     "*.jpg",
     "*.jpeg",
-    "*.png",
 ]
 
 
@@ -165,30 +176,49 @@ def main():
     if rsync_cmd == ["wsl", "rsync"]:
         src = _to_wsl_path(src)
 
-    # Force group-readable/writable permissions on transferred files and dirs.
-    # rsync -a preserves the source file's mode bits by default, but on Windows
-    # there is no real umask: MSYS/Cygwin/WSL rsync ports synthesize a Unix mode
-    # from the Windows read-only attribute, which commonly comes out owner-only
-    # (e.g. 600). That mode then overwrites whatever shared/group permissions
-    # the file had on a multi-user destination. --chmod here adds group rw
-    # (files) / rwx (dirs) and other r/rx on top of the transferred mode, so
-    # collaborators can still read and edit synced files regardless of what
-    # permissions the source machine reported.
-    cmd = rsync_cmd + ["-av", "--update", "--chmod=Fg+rw,Fo+r,Dg+rwx,Do+rx"]
+    # -rlt rather than -a: skipping -p/-g lets new server dirs inherit setgid and
+    # group from their parent (a Windows source has neither to copy). --chmod keeps
+    # files group-writable despite the server umask; F-x drops the execute bits
+    # Windows rsync ports tend to report on plain data files.
+    chmod_opt = "--chmod=Fg+rw,Fo+r,F-x,Dg+rwx,Do+rx"
+    base = rsync_cmd + ["-rltuv"]
+    tail = []
     if args.dry_run:
-        cmd.append("--dry-run")
+        tail.append("--dry-run")
     for pattern in EXCLUDES:
-        cmd += ["--exclude", pattern]
-    cmd += [src, dst]
+        tail += ["--exclude", pattern]
+    tail += [src, dst]
 
     print(f"Source : {args.local_project_dir}")
     print(f"Dest   : {dst}")
     if args.dry_run:
         print("(dry run — no files will be transferred)")
+
+    cmd = base + [chmod_opt] + tail
     print(f"Command: {' '.join(cmd)}")
     print()
+    rc, stderr = _run_rsync(cmd)
 
-    sys.exit(subprocess.run(cmd).returncode)
+    # Old rsync ports (pre-2.6.7, e.g. some DeltaCopy / rsync-win.exe builds) reject
+    # --chmod with exit code 1 before transferring anything. Retry once without it.
+    if rc == 1 and "chmod" in stderr.lower():
+        print("\nWARNING: this rsync build does not support --chmod; retrying without it.")
+        print("Synced files may not be group-writable on the server. Afterwards run there:")
+        print("  chmod -R g+rw <remote project dir>")
+        cmd = base + tail
+        print(f"Command: {' '.join(cmd)}")
+        print()
+        rc, _ = _run_rsync(cmd)
+
+    sys.exit(rc)
+
+
+def _run_rsync(cmd):
+    """Run rsync, streaming stdout live; capture stderr (echoed) for error sniffing."""
+    result = subprocess.run(cmd, stderr=subprocess.PIPE, text=True, errors="replace")
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+    return result.returncode, result.stderr or ""
 
 
 if __name__ == "__main__":

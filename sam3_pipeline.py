@@ -1565,7 +1565,7 @@ def replay_concept_refinements(
     mask_format: str = "png",
     cache_size: int = 50,
     preload_original_masks: bool = False,
-    new_instance_policy: str = "allow",
+    new_instance_policy: str = "disallow",
 ) -> bool:
     """
     Replay saved refinements for ALL instances of a concept in ONE session.
@@ -1613,12 +1613,14 @@ def replay_concept_refinements(
             during propagation that matches none of the sub-states present right
             before propagate_in_video() started (i.e. a genuinely new detection, not
             a live/deleted/absorbed instance under a coincidentally-matching id):
-              "allow" (default): persist its masks under a freshly re-indexed id
+              "allow": persist its masks under a freshly re-indexed id
                   (concept.highest_obj_id + 1, ...) and promote it to a real
-                  SAM3Instance after propagation.
+                  SAM3Instance after propagation. Note that user-deleted instances are
+                  removed from the session first, so they reappear here as "new".
               "latent": leave its sub-state alone (it keeps existing/competing for
                   the rest of this run) but never persist or promote it.
-              "disallow": cap SAM3's max_num_objects so it can never be created.
+              "disallow" (default): cap SAM3's max_num_objects so it can never be
+                  created. Refinement never adds instances beyond what was annotated.
 
     Returns True if propagation ran; False if no pending entries found.
     """
@@ -2237,7 +2239,7 @@ def online_replay_concept_refinements(
     save_cond_states: bool = False,
     save_obj_ptr_prior: bool = False,
     mask_format: str = "png",
-    new_instance_policy: str = "allow",
+    new_instance_policy: str = "disallow",
 ):
     """
     Apply pending refinements for multiple instances through a live session in one propagation pass.

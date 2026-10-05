@@ -2199,15 +2199,17 @@ def main():
                              "redetection under its own id is simply left untouched, rather than "
                              "silently reinforced with stale prior-round content the user never "
                              "sees.")
-    parser.add_argument("--new-instance-policy", default="allow",
+    parser.add_argument("--new-instance-policy", default="disallow",
                         choices=["allow", "latent", "disallow"], dest="new_instance_policy",
                         help="What to do with an object first detected mid-video during "
                              "--refine (not present at the initial detection frame, not a "
-                             "known live/deleted/absorbed instance). 'allow' (default): "
-                             "promote it to a new instance under a freshly assigned id. "
-                             "'latent': let it keep tracking/competing for the rest of this "
-                             "run but never persist or promote it. 'disallow': cap SAM3's "
-                             "max_num_objects so it can never be created in the first place.")
+                             "known live instance). 'disallow' (default): cap SAM3's "
+                             "max_num_objects so it can never be created, so refinement never "
+                             "adds instances beyond those kept during annotation. 'latent': let "
+                             "it keep tracking/competing for the rest of this run but never "
+                             "persist or promote it. 'allow': promote it to a new instance under "
+                             "a freshly assigned id; note that instances deleted in the UI are "
+                             "re-detected and come back as new instances under this policy.")
     parser.add_argument("--save-cond-states", action="store_true", dest="save_cond_states",
                         help="Save maskmem cond-frame states to concepts/<name>/cond_states/ "
                              "after detection/refinement, for a future --restore-cond round. "

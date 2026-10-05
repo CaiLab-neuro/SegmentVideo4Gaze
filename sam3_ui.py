@@ -6400,7 +6400,7 @@ class SAM3VideoUI:
                             project_dir=self.project.project_dir,
                             progress_callback=progress_callback,
                             mask_format=self.project.mask_format,
-                            new_instance_policy="allow",
+                            new_instance_policy="disallow",
                         )
                     except Exception as online_err:
                         # Session may have gone stale — fall back to offline path
@@ -6440,7 +6440,7 @@ class SAM3VideoUI:
                         device=self.device,
                         mask_format=self.project.mask_format,
                         preload_original_masks=False,
-                        new_instance_policy="allow",
+                        new_instance_policy="disallow",
                     )
 
                 # Close dialog and refresh display; save + metadata reset happen there
