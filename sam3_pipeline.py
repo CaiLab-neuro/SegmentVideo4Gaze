@@ -540,8 +540,10 @@ def _inject_mask_anchor_at_frame(
     import cv2
     import numpy as np
     inner_state = sam3_model._all_inference_states[session_id]["state"]
-    if not (inner_state.get("tracker_inference_states") or inner_state.get("sam2_inference_states")):
-        return
+    # No early return when the session has no sub-states yet (e.g. text detection found
+    # nothing live at the detection frame): the seeding path below exists for exactly
+    # that case. An early return here used to skip every mask anchor of such a concept,
+    # leaving the session empty, so propagation ignored all kept instances.
 
     anchors_dir = os.path.join(
         project_dir, "concepts", concept.name,
