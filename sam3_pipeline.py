@@ -55,7 +55,8 @@ def _prune_non_cond_outputs(
     inner_state: dict,
     frame_idx: int,
     keep: int = 20,
-    auto_cond_window: int = 48,
+    auto_cond_window: int = 63,
+    tracker=None,
 ) -> None:
     """Prune stale frame outputs from every tracker state.
 
@@ -65,9 +66,14 @@ def _prune_non_cond_outputs(
 
     Non-cond pruning
     ----------------
-    Evict non_cond_frame_outputs entries older than `keep` frames.  SAM3 attends to at
-    most num_maskmem=7 previous non-cond frames; keep is set to num_maskmem + 2 at each
-    call site via _non_cond_keep_window(), so entries beyond that are never read.
+    Entries within `keep` frames (num_maskmem + 1, via _non_cond_keep_window()) stay
+    intact.  Older entries are evicted, except those the tracker can still read (see
+    _old_non_cond_to_keep): the tracker also reads obj_ptr from up to
+    max_obj_ptrs_in_encoder - 1 = 15 previous frames, and with SAM3's memory selection
+    (use_memory_selection=True) both obj_ptr and maskmem lookups walk back over frames
+    whose eff_iou_score passes mf_threshold, which can be older than `keep`.  Old
+    entries kept only for obj_ptr have maskmem_features dropped (the ~650 KB/obj part).
+    Pass `tracker` so these limits come from the model; without it only `keep` applies.
 
     Cond frame pruning — two categories
     ------------------------------------
@@ -84,10 +90,12 @@ def _prune_non_cond_outputs(
        to cond_frame_outputs (because add_all_frames_to_correct_as_cond=True on the
        tracker).  These are NOT user corrections.  For a 38 K-frame video that is
        ~2,400 auto-recondition cond frames that accumulate without bound.
-       Safe to evict: select_closest_cond_frames always picks the NEAREST cond frame
-       before the current position, so a recondition entry at F-32 is fully superseded
-       by the closer entry at F-16.  We keep the most recent `auto_cond_window` frames
-       worth (default 48 = 3 × 16-frame intervals), which is always more than enough.
+       Safe to evict once out of reach: upstream SAM3 builds the tracker with
+       max_cond_frames_in_attn=4, so select_closest_cond_frames attends to the 4
+       nearest cond frames.  With a 16-frame recondition stride the 4th-nearest can be
+       up to 63 frames back, so we keep the most recent `auto_cond_window` frames worth
+       (default 63: pruned after frame P, [P-63, P] always holds exactly 4 multiples of
+       16, the 4 the next frame would attend to; 48 dropped the 4th one 15 times in 16).
 
     When evicting an auto-recondition cond frame we must maintain the invariant that
     all four of {output_dict["cond_frame_outputs"], consolidated_frame_inds["cond_frame_outputs"],
@@ -97,20 +105,33 @@ def _prune_non_cond_outputs(
     cutoff = frame_idx - keep
     auto_cond_cutoff = frame_idx - auto_cond_window
 
-    tracker_states = (inner_state.get("tracker_inference_states", [])
-                      + inner_state.get("sam2_inference_states", []))
-    for ts in tracker_states:
-        # --- Non-cond pruning (unchanged) ---
+    tracker_states = ([(ts, False) for ts in inner_state.get("tracker_inference_states", [])]
+                      + [(ts, True) for ts in inner_state.get("sam2_inference_states", [])])
+    for ts, is_multiplex in tracker_states:
+        # --- Non-cond pruning ---
         non_cond = ts.get("output_dict", {}).get("non_cond_frame_outputs", {})
-        stale = [f for f in non_cond if f < cutoff]
-        for f in stale:
-            del non_cond[f]
+        keep_full, keep_ptr = _old_non_cond_to_keep(non_cond, frame_idx, cutoff, tracker)
+        kept_old = keep_full | keep_ptr
 
-        for obj_dict in ts.get("output_dict_per_obj", {}).values():
-            non_cond = obj_dict.get("non_cond_frame_outputs", {})
-            stale = [f for f in non_cond if f < cutoff]
+        per_obj_non_cond = [obj_dict.get("non_cond_frame_outputs", {})
+                            for obj_dict in ts.get("output_dict_per_obj", {}).values()]
+        # Per-object entries are slices (views) of the combined entry, so they must be
+        # trimmed too or the combined maskmem_features storage stays alive.
+        for nc in [non_cond] + per_obj_non_cond:
+            stale = [f for f in nc if f < cutoff and f not in kept_old]
             for f in stale:
-                del non_cond[f]
+                del nc[f]
+            for f in keep_ptr:
+                out = nc.get(f)
+                if out is not None and not _maskmem_trimmed(out):
+                    mf = out["maskmem_features"]
+                    # SAM3's remove_object() indexes every stored entry's
+                    # maskmem_features on dim 0, so keep an empty (B, 0) tensor there;
+                    # multiplex checks for None instead.
+                    out["maskmem_features"] = (None if is_multiplex
+                                               else mf.new_empty((mf.shape[0], 0)))
+                    if out.get("image_features") is not None:  # multiplex save_image_features
+                        out["image_features"] = out["image_pos_enc"] = None
 
         # --- Cond frame pruning: auto-recondition entries only ---
         # Collect frames that have user-supplied point inputs — never evict these.
@@ -157,12 +178,70 @@ def _prune_non_cond_outputs(
                 per_frame.pop(f, None)
 
 
+def _maskmem_trimmed(out: dict) -> bool:
+    """True if a non-cond entry no longer has usable maskmem_features."""
+    mf = out.get("maskmem_features")
+    return mf is None or mf.numel() == 0
+
+
+def _old_non_cond_to_keep(non_cond: dict, frame_idx: int, cutoff: int, tracker):
+    """Return (keep_full, keep_ptr): non-cond frames older than `cutoff` that the
+    tracker can still read when tracking frame_idx + 1.
+
+    keep_full need maskmem_features; keep_ptr only need obj_ptr (and eff_iou_score).
+
+    Without memory selection the tracker reads maskmem from the last num_maskmem - 1
+    frames (all inside `cutoff`) and obj_ptr from the last max_obj_ptrs_in_encoder - 1.
+    With memory selection, mirrors SAM3TrackerBase.frame_filter(): walking back from
+    frame_idx it collects frames with eff_iou_score > mf_threshold, plus frame_idx
+    itself if that frame does not qualify; maskmem is read from the newest
+    num_maskmem - 1 of those and obj_ptr from the newest max_obj_ptrs_in_encoder - 1.
+    A frame whose maskmem was already trimmed but that is now needed for maskmem (its
+    newer frames' scores changed after an object removal) is left out, so it gets
+    evicted and frame_filter skips it instead of reading an empty tensor.
+    """
+    if tracker is None:
+        return set(), set()
+    num_maskmem = getattr(tracker, "num_maskmem", 7)
+    num_ptrs = getattr(tracker, "max_obj_ptrs_in_encoder", 16)
+    if not getattr(tracker, "use_memory_selection", False):
+        ptr_cutoff = frame_idx - num_ptrs  # 1-frame buffer, like `keep`
+        return set(), {f for f in non_cond if ptr_cutoff <= f < cutoff}
+
+    mf_threshold = getattr(tracker, "mf_threshold", 0.01)
+
+    def _good(out):
+        score = out.get("eff_iou_score")
+        return score is not None and float(score) > mf_threshold
+
+    cur = non_cond.get(frame_idx)
+    pos = 0 if (cur is not None and _good(cur)) else 1
+    keep_full, keep_ptr = set(), set()
+    # frame_filter scans frame_idx down to 1 (its range() stops before frame 0).
+    for f in sorted((f for f in non_cond if 0 < f <= frame_idx), reverse=True):
+        if pos >= num_ptrs - 1:
+            break
+        out = non_cond[f]
+        if not _good(out):
+            continue
+        if f < cutoff:
+            if pos < num_maskmem - 1:
+                if _maskmem_trimmed(out):
+                    continue
+                keep_full.add(f)
+            else:
+                keep_ptr.add(f)
+        pos += 1
+    return keep_full, keep_ptr
+
+
 def _non_cond_keep_window(sam3_model, extra: int = 1) -> int:
     """Frames to retain in non_cond_frame_outputs: tracker's num_maskmem + a small buffer.
 
     SAM3's tracker attends to at most num_maskmem (default 7) non-cond frames per forward
-    pass, so entries older than that are never read.  We keep num_maskmem + extra (=8) as
-    a buffer in case the model variant differs.  num_maskmem is an architectural constant
+    pass.  We keep num_maskmem + extra (=8) as a buffer in case the model variant differs.
+    Older entries still read for obj_ptr or by memory selection are kept separately by
+    _prune_non_cond_outputs(tracker=...).  num_maskmem is an architectural constant
     trained into the checkpoint, not a user-tunable knob.
     """
     try:
@@ -1392,7 +1471,7 @@ def process_concept_detection(
 
             # Prune stale non_cond_frame_outputs inside each tracker state.
             # (SAM3 stores maskmem tensors per-GPU-rank, not at top-level inner_state.)
-            _prune_non_cond_outputs(inner_state, frame_idx, keep=_keep)
+            _prune_non_cond_outputs(inner_state, frame_idx, keep=_keep, tracker=sam3_model.model.tracker)
             _offload_unselected_cond_frames(inner_state, frame_idx, sam3_model.model.tracker)
 
             # Clear GPU cache periodically
@@ -2075,7 +2154,7 @@ def replay_concept_refinements(
 
                 # Evict after saving — forward propagation never revisits past frames
                 inner_state["cached_frame_outputs"].pop(out_frame_idx, None)
-                _prune_non_cond_outputs(inner_state, out_frame_idx, keep=_keep)
+                _prune_non_cond_outputs(inner_state, out_frame_idx, keep=_keep, tracker=sam3_model.model.tracker)
                 _offload_unselected_cond_frames(inner_state, out_frame_idx, sam3_model.model.tracker)
 
                 if progress_callback:
@@ -2451,7 +2530,7 @@ def online_replay_concept_refinements(
             # Without this the session accumulates full-resolution masks for every
             # propagated frame (OOM on long videos).
             inner_state["cached_frame_outputs"].pop(out_frame_idx, None)
-            _prune_non_cond_outputs(inner_state, out_frame_idx, keep=_keep)
+            _prune_non_cond_outputs(inner_state, out_frame_idx, keep=_keep, tracker=sam3_model.model.tracker)
             _offload_unselected_cond_frames(
                 inner_state, out_frame_idx, sam3_model.model.tracker,
             )
@@ -2551,8 +2630,11 @@ def load_sam3_model(model_name: str = "sam3", device: str = "cuda:0",
             Hopper GPU (H100/H200) and the flash_attn_interface package;
             crashes on Ampere/Ada (e.g. L40S). Ignored for SAM3.
         max_cond_frames_in_attn: How many conditioning frames the tracker attends
-            to per forward pass (default: -1 = no limit, matching SAM3's built-in
-            default).  All user correction anchors are always attended to.
+            to per forward pass (default: -1 = no limit). This overrides the
+            upstream SAM3 builder, which sets 4 (sam3/model_builder.py
+            build_tracker); -1 is the tracker base class's own default and
+            worked well in practice.  All user correction anchors are always
+            attended to.
             Set to a small positive value (e.g. 4) only if attention compute is a
             bottleneck with many correction frames.
 
