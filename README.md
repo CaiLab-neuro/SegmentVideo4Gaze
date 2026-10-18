@@ -123,3 +123,13 @@ git pull
 We would love to hear from you! If you run into a problem, find the documentation unclear, or have an idea for a feature, please open an issue on the [Issues tab](../../issues) — reports from real research workflows are the most valuable guide for where to improve the toolkit.
 
 Code and documentation contributions are also very welcome, from a one-line fix to a new feature. See the [Contribution Guide](CONTRIBUTING.md) for how to set up a development environment, our coding conventions, and the pull-request workflow.
+
+## License
+
+This toolkit is released under the [PolyForm Noncommercial License 1.0.0](LICENSE). You are free to use, modify, and share it for any noncommercial purpose, including academic research, teaching, and personal projects, and it may be used by noncommercial organizations such as universities, charities, and government institutions. Commercial use is not permitted, including commercial use of modified versions or of copies redistributed by others.
+
+For commercial licensing, please contact Ming Bo Cai (mingbo.cai@miami.edu).
+
+The license covers this repository's code only. SAM2 and SAM3, which `install.py` downloads separately, remain under their own licenses from Meta.
+
+By submitting a contribution, you agree that it is licensed under the same terms.
