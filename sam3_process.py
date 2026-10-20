@@ -2159,8 +2159,8 @@ def main():
     parser.add_argument("--max-cond-frames", type=int, default=-1,
                         dest="max_cond_frames_in_attn",
                         help="Number of conditioning frames the tracker attends to per "
-                             "forward pass (default: -1 = no limit; upstream SAM3's "
-                             "builder uses 4).  All user correction anchors are always "
+                             "forward pass (default: -1 = no limit, matching SAM3's "
+                             "built-in default).  All user correction anchors are always "
                              "attended to.  Set to a small positive value (e.g. 4-8) to "
                              "bound attention compute AND GPU memory when a concept has "
                              "many annotation/mask-anchor frames: cond frames outside the "
