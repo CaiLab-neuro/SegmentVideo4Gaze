@@ -2603,14 +2603,17 @@ def load_sam3_model(model_name: str = "sam3", device: str = "cuda:0",
         use_fa3: Enable FlashAttention-3 fp8 kernels (SAM3.1 only). Requires a
             Hopper GPU (H100/H200) and the flash_attn_interface package;
             crashes on Ampere/Ada (e.g. L40S). Ignored for SAM3.
-        max_cond_frames_in_attn: How many conditioning frames the tracker attends
-            to per forward pass (default: -1 = no limit). This overrides the
-            upstream SAM3 builder, which sets 4 (sam3/model_builder.py
-            build_tracker); -1 is the tracker base class's own default and
-            worked well in practice.  All user correction anchors are always
-            attended to.
-            Set to a small positive value (e.g. 4) only if attention compute is a
-            bottleneck with many correction frames.
+        max_cond_frames_in_attn: How many conditioning frames (annotated
+            frames, mask anchors, automatic re-anchors) the tracker attends to
+            per propagated frame.  -1 attends to all of them, so attention
+            compute and GPU memory grow with the number of annotated frames.
+            A positive N attends to the N temporally nearest; the rest stay
+            stored (offloaded to CPU by _offload_unselected_cond_frames) and
+            are attended to again when propagation comes near them.
+            Default: -1 here (the tracker base class's own default); the
+            upstream SAM3 builder sets 4 (sam3/model_builder.py build_tracker).
+            Users can explore what works best; a small N (e.g. 4-16) may be
+            necessary on GPUs with little VRAM.
 
     Returns:
         SAM3 model instance (session-based predictor; same API for both versions)

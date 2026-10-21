@@ -2158,17 +2158,18 @@ def main():
                              "for 1600x1200 video). Lower values save RAM on slow machines.")
     parser.add_argument("--max-cond-frames", type=int, default=-1,
                         dest="max_cond_frames_in_attn",
-                        help="Number of conditioning frames the tracker attends to per "
-                             "forward pass (default: -1 = no limit; upstream SAM3's "
-                             "builder uses 4).  All user correction anchors are always "
-                             "attended to.  Set to a small positive value (e.g. 4-8) to "
-                             "bound attention compute AND GPU memory when a concept has "
-                             "many annotation/mask-anchor frames: cond frames outside the "
-                             "selected window are also offloaded to CPU between propagation "
-                             "steps (see _offload_unselected_cond_frames in sam3_pipeline.py) "
-                             "and transparently reloaded onto GPU only when propagation "
-                             "comes back near them. At -1 this offload is a no-op, since "
-                             "every cond frame is always in the selected window.")
+                        help="How many conditioning frames (annotated frames, mask anchors "
+                             "and automatic re-anchors) the tracker attends to when "
+                             "propagating each frame.  -1 = all of them, so every annotation "
+                             "influences every frame, but attention compute and GPU memory "
+                             "grow with the number of annotated frames in a concept.  A "
+                             "positive N = only the N temporally nearest; the others stay "
+                             "saved (offloaded to CPU) and are attended to again when "
+                             "propagation comes near them, so memory stays bounded however "
+                             "many frames are annotated.  Default: -1 for this program; "
+                             "upstream SAM3's builder uses 4.  Explore what works best for "
+                             "your videos; reducing it (e.g. 4-16) may be necessary on GPUs "
+                             "with little VRAM or for heavily annotated concepts.")
     parser.add_argument("--device", default="cuda:0",
                         help="Device, comma-separated list, or 'all' to use every available GPU "
                              "(e.g. cuda:2, cuda:2,cuda:3, or all). Default: cuda:0")
