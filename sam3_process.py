@@ -282,7 +282,7 @@ def process_project_parallel(args, project, concepts_to_process, devices):
     # Completeness-checked: resumes if a previous extraction was killed midway.
     from sam3_utils import ensure_frames_extracted
     frames_dir = ensure_frames_extracted(
-        project.video_path, project.get_frames_dir(), project.num_frames)
+        project.get_video_path(), project.get_frames_dir(), project.num_frames)
 
     n_workers = min(args.parallel, len(concepts_to_process))
     print(f"\nStarting {n_workers} worker(s) on device(s): {', '.join(devices)}")
@@ -1646,7 +1646,7 @@ def _refine_project_impl(args, project):
 
     from sam3_utils import ensure_frames_extracted
     resource_path = ensure_frames_extracted(
-        project.video_path, project.get_frames_dir(), project.num_frames)
+        project.get_video_path(), project.get_frames_dir(), project.num_frames)
 
     if concepts_to_redetect:
         print(f"\nFound {len(concepts_to_redetect)} concept(s) flagged for full re-detection:")

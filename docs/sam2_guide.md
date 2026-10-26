@@ -122,7 +122,7 @@ python sam2_process.py annotations.json video.mp4 \
 | `--video-only` | Re-render video from existing masks, skip segmentation | — |
 | `--only-updated` | Re-segment only objects marked as updated; reuse other masks | — |
 | `--prev-results` | Directory with previous masks to reuse (with `--only-updated`) | output dir |
-| `--offload-to-cpu` | Offload video frames to CPU to reduce GPU memory usage | — |
+| `--no-offload-to-cpu` | Keep video frames and inference state on the GPU instead of offloading them to CPU (offloading is the default) | offload on |
 | `--frame-dir` | Persistent directory for extracted frames (avoids re-extraction) | temp dir |
 | `--mask-format` | Mask storage format: `png` or `npz` (compressed, faster I/O) | `png` |
 | `--no-bfloat16` | Disable bfloat16 autocast (relevant on pre-Ampere GPUs) | — |
@@ -155,7 +155,7 @@ When a SAM3 installation is detected, the SAM2 UI also offers SAM3 checkpoints f
 ## Troubleshooting
 
 - **Model not found**: run `install.py` to download the checkpoint
-- **GPU out of memory**: use a smaller model (tiny or small), add `--offload-to-cpu`, or reduce video resolution
+- **GPU out of memory**: use a smaller model (tiny or small), make sure `--no-offload-to-cpu` is not set, or reduce video resolution
 - **Path errors**: ensure you're running from the repository directory
 - **Slow UI on long videos**: use `sam2_process.py` for segmentation instead of the in-UI button
 - **dtype-mismatch errors with `--no-bfloat16`**: SAM2 stores some internal tensors in bfloat16 regardless; the default (autocast enabled) is the recommended path

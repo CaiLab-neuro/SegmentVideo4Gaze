@@ -139,10 +139,11 @@ class SAM3Instance:
     sam2_object_id: Optional[int] = None  # SAM2 object ID assigned during export
     # Maximal runs of consecutive frames that have a mask: [(start, end), ...] inclusive
     continuous_periods: List[Tuple[int, int]] = field(default_factory=list)
-    # Best (peak-area) frame per period, computed during propagation while masks are in memory.
-    # Each entry: {"start": int, "end": int, "best_frame": int, "pixel_count": int,
+    # Mask-area stats per period, computed during propagation while masks are in memory.
+    # Each entry: {"start": int, "end": int,
     #              "avg_pixel_ratio": float, "min_pixel_ratio": float, "max_pixel_ratio": float}
     # pixel_ratio fields absent on entries from older project.json files — use .get(..., 0.0).
+    # Older files may also carry "best_frame"/"pixel_count" keys, which are ignored.
     period_peaks: List[dict] = field(default_factory=list)
     # 99th-percentile pixel ratio across all detected frames; used to normalize presence bar
     # height so typical frames read near full height rather than relative to the single maximum.
@@ -368,6 +369,17 @@ class SAM3Project:
                 return self.frames_dir
         video_hash = hashlib.md5(self.video_path.encode()).hexdigest()[:8]
         return os.path.join(tempfile.gettempdir(), f"sam3_frames_{video_hash}")
+
+    def get_video_path(self) -> str:
+        """Return the first reachable source video: video_path, then alt_video_paths.
+
+        Falls back to video_path when none exist so callers report the primary path in
+        their error. Read-only: never modifies project.json.
+        """
+        for p in [self.video_path, *(self.alt_video_paths or [])]:
+            if p and os.path.isfile(p):
+                return p
+        return self.video_path
 
     def get_concept_dir(self, concept_name: str) -> str:
         """Get directory for concept data"""

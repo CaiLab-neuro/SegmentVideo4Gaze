@@ -417,41 +417,34 @@ def _clear_multigpu_buffer(inner_state: dict) -> None:
 def compute_period_peaks(periods: List[Tuple[int, int]],
                          frame_pixel_counts: "dict[int, int]",
                          total_pixels: int = 0) -> List[dict]:
-    """For each (start, end) period return the peak frame and pixel-ratio stats.
+    """For each (start, end) period return the pixel-ratio stats.
 
     Returns a list of dicts:
-        {"start": int, "end": int, "best_frame": int, "pixel_count": int,
+        {"start": int, "end": int,
          "avg_pixel_ratio": float, "min_pixel_ratio": float, "max_pixel_ratio": float}
 
-    pixel_ratio fields are 0.0 when total_pixels is 0 or no counts are available.
-    Intended to be computed once during propagation (while masks are in memory)
-    and stored on SAM3Instance so later operations (delete/absorb anchor
-    generation) can find the best frame per period without re-reading any PNGs.
+    pixel_ratio fields are 0.0 when total_pixels is 0. Periods with no non-empty
+    mask are omitted. Intended to be computed once during propagation (while masks
+    are in memory) and stored on SAM3Instance for the UI's presence timeline.
     """
     peaks = []
     inv = 1.0 / total_pixels if total_pixels > 0 else 0.0
     for start, end in periods:
-        best_frame = None
-        best_count = 0
         total_count = 0
         min_count = None
         max_count = 0
         n_present = 0
         for f in range(start, end + 1):
             c = frame_pixel_counts.get(f, 0)
-            if c > best_count:
-                best_count = c
-                best_frame = f
             if c > 0:
                 total_count += c
                 max_count = max(max_count, c)
                 min_count = c if min_count is None else min(min_count, c)
                 n_present += 1
-        if best_frame is not None and best_count > 0:
-            avg_ratio = (total_count * inv / n_present) if n_present > 0 else 0.0
+        if n_present > 0:
+            avg_ratio = total_count * inv / n_present
             peaks.append({
                 "start": start, "end": end,
-                "best_frame": best_frame, "pixel_count": best_count,
                 "avg_pixel_ratio": avg_ratio,
                 "min_pixel_ratio": (min_count or 0) * inv,
                 "max_pixel_ratio": max_count * inv,
@@ -1314,7 +1307,7 @@ def process_concept_detection(
 
     # 2. Extract frames (reuse if already complete; resume if a prior extraction was killed)
     frames_dir = ensure_frames_extracted(
-        project.video_path, project.get_frames_dir(), project.num_frames)
+        project.get_video_path(), project.get_frames_dir(), project.num_frames)
 
     # 3. Start SAM3 session (SAM3 uses session-based API)
     print(f"Starting SAM3 session for concept '{concept.name}'...")

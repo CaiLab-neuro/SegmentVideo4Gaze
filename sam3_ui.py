@@ -106,6 +106,10 @@ class SAM3VideoUI:
         # Video state
         self.current_frame_idx = 0
         self.video_path: Optional[str] = None
+        # Source video / frames dir resolved for this session (alt or user-located paths).
+        # Passed to every compositor rebuild; project.json is never edited for this.
+        self._session_video_path: Optional[str] = None
+        self._session_frames_dir: Optional[str] = None
         self.num_frames = 0
         self.frame_dimensions = (0, 0)
         self.fps = 0.0
@@ -150,8 +154,8 @@ class SAM3VideoUI:
         self._nav_row1: Optional[tk.Frame] = None   # play/pause + frame nav
         self._nav_row2: Optional[tk.Frame] = None   # presence bar
         self._nav_row3: Optional[tk.Frame] = None   # zoom + speed
-        self._nav_row4: Optional[tk.Frame] = None   # quality colorbars (overlap + bg)
-        self._nav_row5: Optional[tk.Frame] = None   # quality colorbar (inter-frame change)
+        self._nav_row4: Optional[tk.Frame] = None   # quality colorbars (change + bg)
+        self._nav_row5: Optional[tk.Frame] = None   # quality colorbar (overlap)
         self._export_btn: Optional[tk.Button] = None  # "Export Video/Image" button
 
         # Timeline zoom (slider window)
@@ -187,7 +191,7 @@ class SAM3VideoUI:
         # Global all-concepts-combined fallback tracks (older files / unknown concept).
         self._quality_overlap_global: Optional[List[float]] = None
         self._quality_inter_global: Optional[List[float]] = None
-        # Which concept the Overlap/Change bars currently show (None = global).
+        # Which concept the Change/Overlap bars currently show (None = global).
         self._quality_bars_concept: Optional[str] = None
         # When True, _draw_quality_colorbars() redraws bars from scratch; otherwise
         # only the playhead is moved (same fast-path logic as _presence_bar_dirty).
@@ -592,7 +596,7 @@ class SAM3VideoUI:
         self._update_zoom_button_highlight()
         self._update_speed_button_highlight()
 
-        # ── Row 4 (compact): quality colorbars (overlap + background ratio) ────
+        # ── Row 4 (compact): quality colorbars (inter-frame change + background ratio) ────
         # Uses grid (not pack) so the two canvases split the row's width exactly
         # 50/50 regardless of window size — pack's expand allocates space
         # sequentially, so the label sitting between them would otherwise steal
@@ -602,12 +606,12 @@ class SAM3VideoUI:
         row4.columnconfigure(1, weight=1, uniform="qbar")
         row4.columnconfigure(3, weight=1, uniform="qbar")
 
-        tk.Label(row4, text="Overlap:", font=("Arial", 7), fg="gray", width=7,
+        tk.Label(row4, text="Change:", font=("Arial", 7), fg="gray", width=7,
                  anchor=tk.W).grid(row=0, column=0, sticky="w")
-        self.quality_overlap_canvas = tk.Canvas(row4, height=10, bg='#2a2a2a',
-                                                relief=tk.FLAT, bd=0)
-        self.quality_overlap_canvas.grid(row=0, column=1, sticky="ew", padx=(0, 6))
-        self.quality_overlap_canvas.bind('<Button-1>', self._on_quality_bar_click)
+        self.quality_inter_canvas = tk.Canvas(row4, height=10, bg='#2a2a2a',
+                                              relief=tk.FLAT, bd=0)
+        self.quality_inter_canvas.grid(row=0, column=1, sticky="ew", padx=(0, 6))
+        self.quality_inter_canvas.bind('<Button-1>', self._on_quality_bar_click)
 
         tk.Label(row4, text="BG:", font=("Arial", 7), fg="gray", width=3,
                  anchor=tk.W).grid(row=0, column=2, sticky="w")
@@ -616,16 +620,16 @@ class SAM3VideoUI:
         self.quality_bg_canvas.grid(row=0, column=3, sticky="ew")
         self.quality_bg_canvas.bind('<Button-1>', self._on_quality_bar_click)
 
-        # ── Row 5 (compact): inter-frame change, spans full width ──────────
+        # ── Row 5 (compact): overlap, spans full width ──────────
         self._nav_row5 = row5 = tk.Frame(parent)
         row5.pack(fill=tk.X, padx=5, pady=(0, 3))
 
-        tk.Label(row5, text="Change:", font=("Arial", 7), fg="gray", width=7,
+        tk.Label(row5, text="Overlap:", font=("Arial", 7), fg="gray", width=7,
                  anchor=tk.W).pack(side=tk.LEFT)
-        self.quality_inter_canvas = tk.Canvas(row5, height=8, bg='#2a2a2a',
-                                              relief=tk.FLAT, bd=0)
-        self.quality_inter_canvas.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.quality_inter_canvas.bind('<Button-1>', self._on_quality_bar_click)
+        self.quality_overlap_canvas = tk.Canvas(row5, height=8, bg='#2a2a2a',
+                                                relief=tk.FLAT, bd=0)
+        self.quality_overlap_canvas.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.quality_overlap_canvas.bind('<Button-1>', self._on_quality_bar_click)
 
     def _setup_controls_panel(self, parent):
         """Setup right panel with instance controls"""
@@ -1677,7 +1681,7 @@ class SAM3VideoUI:
     def _load_quality_metrics(self, project_dir: str):
         """Load quality_metrics.npz from project_dir into self.quality_bg/overlap.
 
-        The Overlap and Change bars are per-concept: they follow the currently
+        The Change and Overlap bars are per-concept: they follow the currently
         selected concept (see _refresh_concept_quality_bars()).  The Background
         bar is always the single global track.  Older metrics files without
         per-concept data fall back to the global all-concepts-combined track.
@@ -1708,7 +1712,7 @@ class SAM3VideoUI:
         self._refresh_concept_quality_bars(redraw=True)
 
     def _refresh_concept_quality_bars(self, redraw: bool = True):
-        """Point the Overlap/Change bars at the currently selected concept.
+        """Point the Change/Overlap bars at the currently selected concept.
 
         When per-concept metrics exist and a concept is selected, show that
         concept's tracks; otherwise fall back to the global combined tracks.
@@ -1737,7 +1741,7 @@ class SAM3VideoUI:
             self._draw_quality_colorbars()
 
     def _draw_quality_colorbars(self):
-        """Render the overlap, background-ratio, and inter-frame change colorbars with a playhead.
+        """Render the inter-frame change, background-ratio, and overlap colorbars with a playhead.
 
         Background is rendered to a numpy pixel array and cached as a PhotoImage —
         O(canvas_width) numpy ops, zero per-pixel canvas items.  On plain frame
@@ -1845,6 +1849,14 @@ class SAM3VideoUI:
     # Video Loading
     # ============================================================
 
+    def _new_compositor(self):
+        """Build a compositor from the paths resolved for this session."""
+        return DynamicFrameCompositor(
+            self.project,
+            video_path=self._session_video_path,
+            frames_dir=self._session_frames_dir,
+        )
+
     def _create_compositor(self):
         """Create DynamicFrameCompositor for self.project.
 
@@ -1860,8 +1872,10 @@ class SAM3VideoUI:
 
         Returns the compositor, or None if the user cancelled.
         """
+        self._session_video_path = None
+        self._session_frames_dir = None
         try:
-            return DynamicFrameCompositor(self.project)
+            return self._new_compositor()
         except ValueError as exc:
             if "Failed to open video" not in str(exc):
                 raise
@@ -1908,14 +1922,9 @@ class SAM3VideoUI:
                 return None
             if not self._verify_video_frame_count(str(p)):
                 return None
-            _orig = self.project.video_path
-            self.project.video_path = str(p)
-            try:
-                return DynamicFrameCompositor(self.project)
-            except Exception:
-                return None
-            finally:
-                self.project.video_path = _orig
+            comp = DynamicFrameCompositor(self.project, video_path=str(p))
+            self._session_video_path = str(p)
+            return comp
         except Exception:
             return None
 
@@ -1930,14 +1939,9 @@ class SAM3VideoUI:
                 return None
             if not self._verify_frames_dir_count(str(p)):
                 return None
-            _orig = self.project.frames_dir
-            self.project.frames_dir = str(p)
-            try:
-                return DynamicFrameCompositor(self.project)
-            except Exception:
-                return None
-            finally:
-                self.project.frames_dir = _orig
+            comp = DynamicFrameCompositor(self.project, frames_dir=str(p))
+            self._session_frames_dir = str(p)
+            return comp
         except Exception:
             return None
 
@@ -1997,17 +2001,17 @@ class SAM3VideoUI:
                     "Use it anyway?",
                 ):
                     return None
-            _orig = self.project.video_path
-            self.project.video_path = chosen
             try:
-                comp = DynamicFrameCompositor(self.project)
-                self._add_alt_video_path(chosen)
-                return comp
+                comp = DynamicFrameCompositor(self.project, video_path=chosen)
             except Exception as e:
                 messagebox.showerror("Error", f"Could not open video:\n{e}")
                 return None
-            finally:
-                self.project.video_path = _orig
+            self._session_video_path = chosen
+            try:
+                self._add_alt_video_path(chosen)
+            except Exception as e:
+                print(f"[VideoPath] Could not save alternative video path: {e}")
+            return comp
         else:  # No → frames directory
             chosen = filedialog.askdirectory(title="Locate frames directory")
             if not chosen:
@@ -2020,17 +2024,17 @@ class SAM3VideoUI:
                     "Use it anyway?",
                 ):
                     return None
-            _orig = self.project.frames_dir
-            self.project.frames_dir = chosen
             try:
-                comp = DynamicFrameCompositor(self.project)
-                self._add_alt_frames_dir(chosen)
-                return comp
+                comp = DynamicFrameCompositor(self.project, frames_dir=chosen)
             except Exception as e:
                 messagebox.showerror("Error", f"Could not use frames directory:\n{e}")
                 return None
-            finally:
-                self.project.frames_dir = _orig
+            self._session_frames_dir = chosen
+            try:
+                self._add_alt_frames_dir(chosen)
+            except Exception as e:
+                print(f"[VideoPath] Could not save alternative frames path: {e}")
+            return comp
 
     def _add_alt_video_path(self, path: str) -> None:
         """Add *path* to project.alt_video_paths (dedup) and save."""
@@ -2384,7 +2388,9 @@ class SAM3VideoUI:
             self.current_frame_idx = 0
 
             # Initialize compositor
-            self.compositor = DynamicFrameCompositor(self.project)
+            self._session_video_path = None
+            self._session_frames_dir = None
+            self.compositor = self._new_compositor()
 
             # Populate in-memory annotation cache from project files
             self._load_points_cache_from_project()
@@ -3293,7 +3299,7 @@ class SAM3VideoUI:
                 concept.visible = not concept.visible
                 self._safe_project_save()
                 self.update_concept_tree()
-                self.compositor = DynamicFrameCompositor(self.project)  # Refresh compositor
+                self.compositor = self._new_compositor()  # Refresh compositor
                 self.display_frame()
                 self.status_var.set(f"Concept '{concept_name}' {'shown' if concept.visible else 'hidden'}.")
 
@@ -3308,7 +3314,7 @@ class SAM3VideoUI:
                     instance.visible = not instance.visible
                     self._safe_project_save()
                     self.update_concept_tree()
-                    self.compositor = DynamicFrameCompositor(self.project)  # Refresh compositor
+                    self.compositor = self._new_compositor()  # Refresh compositor
                     self.display_frame()
                     self.status_var.set(f"Instance '{instance.user_name}' {'shown' if instance.visible else 'hidden'}.")
 
@@ -3432,7 +3438,7 @@ class SAM3VideoUI:
         self._safe_project_save()
         self._invalidate_presence_cache()
         self.update_concept_tree()
-        self.compositor = DynamicFrameCompositor(self.project)  # Refresh compositor
+        self.compositor = self._new_compositor()  # Refresh compositor
         self.display_frame()
         self._update_session_status()
 
@@ -3538,7 +3544,7 @@ class SAM3VideoUI:
 
         self._safe_project_save()
         self.update_concept_tree()
-        self.compositor = DynamicFrameCompositor(self.project)
+        self.compositor = self._new_compositor()
         self.display_frame()
         self._update_session_status()
         self.status_var.set(f"Concept '{concept.name}' removed.")
@@ -3619,7 +3625,7 @@ class SAM3VideoUI:
         self.redo_stack.clear()
 
         self.update_concept_tree()
-        self.compositor = DynamicFrameCompositor(self.project)
+        self.compositor = self._new_compositor()
         self.display_frame()
         self._update_session_status()
         self.status_var.set(
@@ -3870,7 +3876,7 @@ class SAM3VideoUI:
 
         self._metadata_dirty = True
         self.update_concept_tree()
-        self.compositor = DynamicFrameCompositor(self.project)
+        self.compositor = self._new_compositor()
         self.display_frame()
 
         desc = (f"mask at frame {result['frame_idx']}" if result['type'] == 'mask'
@@ -3958,104 +3964,6 @@ class SAM3VideoUI:
         dialog = VocabularyEditorDialog(self.root, self)
         self.root.wait_window(dialog.top)
         self._update_name_combobox_values()
-
-    def _compute_per_period_anchors(self, concept, instance, is_positive: bool,
-                                    tag: Optional[str] = None,
-                                    first_period_only: bool = False) -> List[dict]:
-        """For each continuous detection period of instance, find the frame with the
-        largest mask area and return a refinements.json entry (propagated=False) whose
-        point is the centroid of that mask.
-
-        is_positive: polarity of the generated points.
-        tag: optional key added to each entry for identification (e.g. 'auto_absorb_positive').
-        first_period_only: if True, only the instance's first detected period is used.
-            Later periods can have drifted segmentation (tracking error), so callers that
-            treat the instance's identity as established only at its first appearance
-            (e.g. absorb) should set this so the user can judge correctness from that
-            single occurrence rather than propagating potential drift everywhere.
-
-        Samples at most 20 evenly-spaced frames per period so long videos don't block
-        the UI, then reads only the single best-candidate PNG to compute the centroid.
-        """
-        if not self.project:
-            return []
-        mask_dir = os.path.join(
-            self.project.project_dir, "concepts", concept.name,
-            "instances", str(instance.sam3_obj_id), "masks"
-        )
-        if not os.path.exists(mask_dir):
-            return []
-
-        # Use stored period_peaks when available — avoids scanning any PNGs to find the
-        # best frame; only the single peak-frame PNG per period needs to be read for centroid.
-        # Fall back to sampling when period_peaks is absent (old projects, post-edit state).
-        if instance.period_peaks:
-            peak_iter = [(p["best_frame"], None) for p in instance.period_peaks]
-            if first_period_only:
-                peak_iter = peak_iter[:1]
-        else:
-            periods = instance.continuous_periods or compute_continuous_periods(mask_dir)
-            if not periods:
-                return []
-            if first_period_only:
-                periods = periods[:1]
-            peak_iter = []
-            for start, end in periods:
-                period_frames = list(range(start, end + 1))
-                if len(period_frames) > 20:
-                    step = len(period_frames) / 20
-                    period_frames = [period_frames[int(i * step)] for i in range(20)]
-                best_frame = None
-                best_area = 0
-                for frame_idx in period_frames:
-                    m = load_sam3_mask(mask_dir, frame_idx)
-                    if m is None:
-                        continue
-                    area = int((m > 127).sum())
-                    if area > best_area:
-                        best_area = area
-                        best_frame = frame_idx
-                if best_frame is not None and best_area > 0:
-                    peak_iter.append((best_frame, None))
-
-        from datetime import datetime
-        entries = []
-        for best_frame, _ in peak_iter:
-            if best_frame is None:
-                continue
-
-            mask = load_sam3_mask(mask_dir, best_frame)
-            if mask is None:
-                continue
-            binary = (mask > 127).astype(np.uint8)
-            M = cv2.moments(binary)
-            if M["m00"] == 0:
-                continue
-            cx = M["m10"] / M["m00"]
-            cy = M["m01"] / M["m00"]
-
-            # The moments-based centroid is just the mean pixel position, which can land
-            # outside the mask for non-convex shapes (e.g. a "C"/crescent/ring, or two
-            # blobs joined by a thin neck). A guidance point outside the mask is
-            # meaningless to SAM3, so fall back to the point most distant from the mask
-            # boundary (distance-transform peak) — guaranteed to lie inside the mask, and
-            # generally a more representative "interior" point than the centroid anyway.
-            if not binary[int(round(cy)), int(round(cx))]:
-                dist = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
-                iy, ix = np.unravel_index(np.argmax(dist), dist.shape)
-                cx, cy = float(ix), float(iy)
-
-            entry: dict = {
-                "timestamp": datetime.now().isoformat(),
-                "frame_idx": best_frame,
-                "points": [{"x": float(cx), "y": float(cy), "is_positive": is_positive}],
-                "propagated": False,
-            }
-            if tag:
-                entry[tag] = True
-            entries.append(entry)
-
-        return entries
 
     def _stage_anchors_to_cache(self, concept, instance, entries: List[dict]):
         """Merge anchor entries into both annotation caches (in-memory only) and mark dirty.
@@ -4277,7 +4185,7 @@ class SAM3VideoUI:
         self._mark_presence_dirty()
         self._metadata_dirty = True
         self.update_concept_tree()
-        self.compositor = DynamicFrameCompositor(self.project)
+        self.compositor = self._new_compositor()
         self.display_frame()
 
         if len(deleted_names) == 1:
@@ -4832,7 +4740,7 @@ class SAM3VideoUI:
         self.update_concept_tree()
         # The source is now deleted; keep the surviving target highlighted.
         self._select_instance_in_tree(target.concept_name, target.sam3_obj_id)
-        self.compositor = DynamicFrameCompositor(self.project)
+        self.compositor = self._new_compositor()
         self.display_frame()
 
         sr = wiz['source_result']
@@ -5090,7 +4998,7 @@ class SAM3VideoUI:
         # Keep the merged instance highlighted (the source instances are gone).
         if concept_name is not None and merged_id is not None:
             self._select_instance_in_tree(concept_name, merged_id)
-        self.compositor = DynamicFrameCompositor(self.project)  # Refresh compositor
+        self.compositor = self._new_compositor()  # Refresh compositor
         self.display_frame()
         self.status_var.set(f"Instances merged into '{new_name}'.")
         messagebox.showinfo("Success", f"Instances merged successfully into '{new_name}'.")
@@ -5516,7 +5424,7 @@ class SAM3VideoUI:
             self._metadata_dirty = True
             self._mark_presence_dirty()
             self.update_concept_tree()
-            self.compositor = DynamicFrameCompositor(self.project)
+            self.compositor = self._new_compositor()
             self.display_frame()
             self.status_var.set(f"Restored '{action['instance'].user_name}'.")
 
@@ -5532,7 +5440,7 @@ class SAM3VideoUI:
                 action['target'].received_absorb_anchor = False
             self._metadata_dirty = True
             self.update_concept_tree()
-            self.compositor = DynamicFrameCompositor(self.project)
+            self.compositor = self._new_compositor()
             self.display_frame()
             self.status_var.set(f"Absorb undone: '{action['source'].user_name}' restored.")
 
@@ -5568,7 +5476,7 @@ class SAM3VideoUI:
                 action['target'].received_absorb_anchor = False
             self._metadata_dirty = True
             self.update_concept_tree()
-            self.compositor = DynamicFrameCompositor(self.project)
+            self.compositor = self._new_compositor()
             self.display_frame()
             self.status_var.set(f"Absorb undone: '{action['source'].user_name}' restored.")
 
@@ -5602,7 +5510,7 @@ class SAM3VideoUI:
             self._remove_mask_anchor_triggers(
                 concept.name, inst.sam3_obj_id, [frame_idx])
             self._metadata_dirty = True
-            self.compositor = DynamicFrameCompositor(self.project)
+            self.compositor = self._new_compositor()
             self.display_frame()
             self.status_var.set(f"Undid saved mask anchor at frame {frame_idx}.")
 
@@ -5634,7 +5542,7 @@ class SAM3VideoUI:
                         [e['frame_idx'] for e in mask_anchor_entries])
             self._metadata_dirty = True
             self.update_concept_tree()
-            self.compositor = DynamicFrameCompositor(self.project)
+            self.compositor = self._new_compositor()
             self.display_frame()
             self.status_var.set(f"Renamed back to '{action['old_name']}'.")
 
@@ -5648,7 +5556,7 @@ class SAM3VideoUI:
                 concept.completed_at = action.get('snapshot_completed_at')
                 self._concepts_pending_reset.discard(cname)
                 self.update_concept_tree()
-                self.compositor = DynamicFrameCompositor(self.project)
+                self.compositor = self._new_compositor()
                 self.display_frame()
                 self.status_var.set(f"Undid reset of concept '{cname}'.")
 
@@ -5773,7 +5681,7 @@ class SAM3VideoUI:
             self._metadata_dirty = True
             self._mark_presence_dirty()
             self.update_concept_tree()
-            self.compositor = DynamicFrameCompositor(self.project)
+            self.compositor = self._new_compositor()
             self.display_frame()
             self.status_var.set(f"Re-deleted '{action['instance'].user_name}'.")
 
@@ -5787,7 +5695,7 @@ class SAM3VideoUI:
                 action['target'].received_absorb_anchor = True
             self._metadata_dirty = True
             self.update_concept_tree()
-            self.compositor = DynamicFrameCompositor(self.project)
+            self.compositor = self._new_compositor()
             self.display_frame()
             self.status_var.set(f"Re-absorbed '{action['source'].user_name}'.")
 
@@ -5824,7 +5732,7 @@ class SAM3VideoUI:
                         mask_anchor_entries)
             self._metadata_dirty = True
             self.update_concept_tree()
-            self.compositor = DynamicFrameCompositor(self.project)
+            self.compositor = self._new_compositor()
             self.display_frame()
             self.status_var.set(f"Re-absorbed '{action['source'].user_name}'.")
 
@@ -5854,7 +5762,7 @@ class SAM3VideoUI:
                 inst.mask_anchor_frames.sort()
             self._stage_anchors_to_cache(concept, inst, [action['trigger_entry']])
             self._metadata_dirty = True
-            self.compositor = DynamicFrameCompositor(self.project)
+            self.compositor = self._new_compositor()
             self.display_frame()
             self.status_var.set(f"Redid mask anchor save at frame {frame_idx}.")
 
@@ -5881,7 +5789,7 @@ class SAM3VideoUI:
                         mask_anchor_entries)
             self._metadata_dirty = True
             self.update_concept_tree()
-            self.compositor = DynamicFrameCompositor(self.project)
+            self.compositor = self._new_compositor()
             self.display_frame()
             self.status_var.set(f"Renamed to '{action['new_name']}'.")
 
@@ -5901,7 +5809,7 @@ class SAM3VideoUI:
                     self._dirty_keys.discard(k)
                 self._invalidate_presence_cache()
                 self.update_concept_tree()
-                self.compositor = DynamicFrameCompositor(self.project)
+                self.compositor = self._new_compositor()
                 self.display_frame()
                 self.status_var.set(f"Re-applied reset of concept '{cname}'.")
 
@@ -6475,7 +6383,7 @@ class SAM3VideoUI:
                 self._points_cache.pop(key, None)
                 self._dirty_keys.discard(key)
         self._invalidate_presence_cache()
-        self.compositor = DynamicFrameCompositor(self.project)  # Refresh compositor
+        self.compositor = self._new_compositor()  # Refresh compositor
         self.update_concept_tree()  # Refresh coverage % from updated metadata
         self.display_frame()
         self.points_label.config(text="Points: 0  Boxes: 0")
@@ -6773,7 +6681,7 @@ class SAM3VideoUI:
                                           overwrite=True)
                 self.project.frames_dir = frames_dir
                 self._safe_project_save()
-                self.compositor = DynamicFrameCompositor(self.project)
+                self.compositor = self._new_compositor()
                 self.root.after(0, lambda: self.status_var.set(
                     f"Frame cache ready: {frames_dir}"))
                 self.root.after(0, lambda: messagebox.showinfo(
@@ -6815,7 +6723,7 @@ class SAM3VideoUI:
                     self.project.video_path, self.project.project_dir)
                 self.project.mjpeg_video_path = result
                 self._safe_project_save()
-                self.compositor = DynamicFrameCompositor(self.project)
+                self.compositor = self._new_compositor()
                 self.root.after(0, lambda: self.status_var.set(
                     f"MJPEG video ready: {result}"))
                 self.root.after(0, lambda: messagebox.showinfo(
@@ -6864,7 +6772,7 @@ class SAM3VideoUI:
         shutil.rmtree(frames_dir)
         self.project.frames_dir = None
         self._safe_project_save()
-        self.compositor = DynamicFrameCompositor(self.project)
+        self.compositor = self._new_compositor()
         self.status_var.set(f"Frame cache deleted: {frames_dir}")
 
     # ============================================================

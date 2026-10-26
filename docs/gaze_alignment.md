@@ -119,6 +119,10 @@ python process_gaze_mask_alignment.py \
 | `--skip-figures` | Skip trajectory and confidence heatmap figures |
 | `--vector-figures` | Keep the per-sample trajectory and heatmap as vector graphics in the PDFs. By default they are rasterized at 300 dpi inside the PDF (axes and text stay vector), which keeps PDFs small and fast for long recordings |
 | `--category-sort` | Row ordering in figures: `first_seen` (default) or `frequency` |
+| `--min-gaze-fraction` | Figure rows (0–1, default `0.03`): a category gets its own row if its mean score over the plotted gaze points is at least this. In the trajectory plot the score is 1 for points labelled with the category, so this is the fraction of points labelled with it; in the confidence heatmap the score is the category's confidence, so the mean also counts partial overlaps with the gaze disk and categories that are often near the gaze but rarely win. Categories below the threshold, and `no_object`, are pooled into one `other (N categories)` row. The pooled categories and their scores are written to the log (`Trajectory plot: 'other' pools ...`, `Confidence heatmap: 'other' pools ...`) |
+| `--max-plot-categories` | Maximum number of own rows per figure, default `12` (the pooled `other` row is extra). Pinned categories always count |
+| `--always-show` | Comma-separated categories that always get their own row whatever their score, by category name (e.g. `head_parent_head`) or instance name (e.g. `parent_head`). Use it for objects that matter to your study even if rarely gazed at. A name that matches nothing is reported as a warning |
+| `--no-group-categories` | Plot every category as its own row (no `other` row), as in earlier versions |
 | `--start-plot-time` / `--end-plot-time` | Time window (seconds) for method-figure plots |
 | `--log-path` | Path for the log file (default: `{output_dir}/gaze_object.log`) |
 
@@ -130,6 +134,7 @@ python process_gaze_mask_alignment.py \
 - **`output_dir/{subject_id}/{camera}/{subject_id}_{camera}_gaze_blink_labeled.csv`** — blink-labeled gaze data when `--blink-dir` is used
 - **`output_dir/{subject_id}/{camera}/{subject_id}_{camera}_gaze_blink_removed.csv`** — blink-removed gaze data when `--blink-dir` is used
 - **`output_dir/{subject_id}/{camera}/figures/`** — trajectory plots and confidence heatmaps (PNG and PDF)
+  (rarely gazed-at categories are pooled into an `other` row; see `--min-gaze-fraction`. Grouping affects only the figures, not the CSV or pickle outputs)
 
 With `--ignore-object-list`, the CSV, `.pkl` and `.settings.json` names get an `_excluding_ignored_objects` suffix.
 - **`output_dir/gaze_object.log`** — processing log (or path set by `--log-path`)

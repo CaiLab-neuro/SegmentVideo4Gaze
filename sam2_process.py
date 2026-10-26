@@ -484,7 +484,7 @@ class ConsoleProgressCallback:
 
 
 class SAM2Processor:
-    def __init__(self, config_file=None, checkpoint_file=None, model_name="sam2.1-base+", offload_to_cpu=False, async_loading=False, smooth_masks=False, device=None, frame_format="jpg", exclusive_masks=False, mask_format="png", vos_optimized=False, no_bfloat16=False, max_cond_frames_in_attn=-1):
+    def __init__(self, config_file=None, checkpoint_file=None, model_name="sam2.1-base+", offload_to_cpu=True, async_loading=False, smooth_masks=False, device=None, frame_format="jpg", exclusive_masks=False, mask_format="png", vos_optimized=False, no_bfloat16=False, max_cond_frames_in_attn=-1):
         """
         Initialize SAM2 Processor
 
@@ -492,7 +492,7 @@ class SAM2Processor:
             config_file: Path to model config YAML (overrides model_name)
             checkpoint_file: Path to checkpoint file (overrides model_name)
             model_name: Preset model name (e.g., 'sam2-base+', 'sam2.1-large', 'sam3')
-            offload_to_cpu: Use SAM2's CPU offloading for memory optimization
+            offload_to_cpu: Use SAM2's CPU offloading (video frames and inference state) for memory optimization (default True)
             async_loading: Use async frame loading (experimental, may reduce memory)
             smooth_masks: Apply morphological smoothing to reduce pixelation in masks
             device: Device to use (e.g., 'cpu', 'cuda', 'cuda:0', 'cuda:1'). If None, auto-detect.
@@ -1594,8 +1594,8 @@ Examples:
   # Use SAM2.1 large model
   python sam2_process.py annotations.json video.mp4 --model sam2.1-large
 
-  # Use CPU offloading for memory optimization
-  python sam2_process.py annotations.json video.mp4 --offload-to-cpu
+  # Keep video frames and inference state on the GPU (CPU offloading is on by default)
+  python sam2_process.py annotations.json video.mp4 --no-offload-to-cpu
 
   # Use a specific GPU (e.g., cuda:1)
   python sam2_process.py annotations.json video.mp4 --device cuda:1
@@ -1634,8 +1634,8 @@ Examples:
                             "errors. Primarily useful on pre-Ampere GPUs if autocast causes "
                             "problems. On pre-Ampere GPUs without this flag you will be asked "
                             "interactively.")
-    parser.add_argument("--offload-to-cpu", action="store_true",
-                       help="Offload video frames and model state to CPU to reduce GPU memory usage (slightly increases CPU memory usage and at a cost of a slightly slower speed)")
+    parser.add_argument("--no-offload-to-cpu", dest="offload_to_cpu", action="store_false",
+                       help="Keep video frames and model state on the GPU instead of offloading them to CPU (offloading is the default; it lowers GPU memory at the cost of CPU memory and slightly slower speed)")
     parser.add_argument("--async-loading", action="store_true",
                        help="Use async frame loading (not much benefit. Just kept this feature as it is available)")
     parser.add_argument("--smooth-masks", action="store_true",

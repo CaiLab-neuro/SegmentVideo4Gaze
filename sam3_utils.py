@@ -647,7 +647,8 @@ class DynamicFrameCompositor:
     then blend with original frame ONCE to avoid repeated downweighting.
     """
 
-    def __init__(self, project: SAM3Project, use_mjpeg: bool = True):
+    def __init__(self, project: SAM3Project, use_mjpeg: bool = True,
+                 video_path: Optional[str] = None, frames_dir: Optional[str] = None):
         """
         Initialize compositor.
 
@@ -656,14 +657,17 @@ class DynamicFrameCompositor:
         Args:
             project: SAM3 project
             use_mjpeg: Use MJPEG re-encoded video if available (faster random access)
+            video_path: Source video to open instead of the project's (first reachable of
+                video_path / alt_video_paths). The project is never modified.
+            frames_dir: Frame directory to use instead of project.get_frames_dir().
         """
         self.project = project
 
         # Extracted-frame directory (fastest: true random access, no seeking)
-        candidate = project.get_frames_dir()
+        candidate = frames_dir or project.get_frames_dir()
         self.frames_dir = candidate if os.path.isdir(candidate) else None
         if self.frames_dir:
-            kind = "persistent" if project.frames_dir else "temporary"
+            kind = "persistent" if (frames_dir or project.frames_dir) else "temporary"
             print(f"Using {kind} frame cache for playback: {self.frames_dir}")
 
         # Open video fallback (MJPEG preferred over original for seeking performance)
@@ -672,7 +676,7 @@ class DynamicFrameCompositor:
             if not self.frames_dir:
                 print(f"Using MJPEG video for fast playback: {video_path}")
         else:
-            video_path = project.video_path
+            video_path = video_path or project.get_video_path()
 
         self.video_cap = cv2.VideoCapture(video_path)
         if not self.video_cap.isOpened():
