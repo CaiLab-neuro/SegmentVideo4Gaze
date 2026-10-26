@@ -21,6 +21,7 @@ import logging, sys
 import argparse
 import re
 import functools
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from logging.handlers import QueueHandler, QueueListener
@@ -573,6 +574,40 @@ def format_log_datetime(dt: Optional[datetime] = None) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S %Z%z")
 
 
+OTHER_KEY = "__other__"  # row key of the pooled "other" row; cannot clash with a category name
+
+
+def _select_plot_categories(mean_scores: dict, min_fraction: float, max_rows: int,
+                            always_show=(), never_keep=("no_object",)):
+    """Decide which categories get their own row in a figure; the rest are pooled as "other".
+
+    mean_scores maps category -> mean score over the plotted gaze points: the fraction of
+    points labelled with the category (trajectory plot) or its mean confidence (heatmap).
+    A category gets a row if it is pinned (always_show) or its score is > 0 and >= min_fraction;
+    at most max_rows rows are kept (pinned ones always count). Categories in never_keep
+    can only end up in "other". Returns (kept, other): kept = categories, highest score first
+    (ties alphabetical); other = [(category, score)] for the pooled ones, highest first.
+    """
+    order = sorted(mean_scores, key=lambda c: (-mean_scores[c], c))
+    pinned = [c for c in order if c in set(always_show) and c not in never_keep]
+    extra = [c for c in order if c not in pinned and c not in never_keep
+             and 0 < mean_scores[c] and mean_scores[c] >= min_fraction][:max(max_rows - len(pinned), 0)]
+    kept = sorted(pinned + extra, key=lambda c: (-mean_scores[c], c))
+    return kept, [(c, float(mean_scores[c])) for c in order if c not in kept]
+
+
+def _describe_pooled(figure: str, other: list, score_name: str, display_map=None) -> str:
+    """Log line naming every category pooled into "other" with its score."""
+    display_map = display_map or {}
+    shown = [(c, v) for c, v in other if v > 0]
+    if not shown:
+        return f"{figure}: no categories pooled into 'other'."
+    parts = ", ".join(f"{'no object' if c == 'no_object' else display_map.get(c, c)} {v:.3f}" for c, v in shown)
+    unseen = len(other) - len(shown)
+    note = f"; {unseen} more with score 0 omitted" if unseen else ""
+    return f"{figure}: 'other' pools {len(shown)} categories ({score_name}): {parts}{note}"
+
+
 class GazeObjectAligner:
     def __init__(
         self,
@@ -595,7 +630,24 @@ class GazeObjectAligner:
         pipeline: str = "auto",
         vector_figures: bool = False,
         gaze_aggregate: str = "none",
+        group_categories: bool = True,
+        min_gaze_fraction: float = 0.03,
+        max_plot_categories: int = 12,
+        always_show: tuple = (),
     ):
+        # Figure rows: a category gets its own row if its mean score over the plotted gaze
+        # points is >= min_gaze_fraction (fraction of points labelled with it in the
+        # trajectory plot, mean confidence in the heatmap), at most max_plot_categories rows;
+        # the rest (and no_object) are pooled into one "other" row. always_show pins categories
+        # (category or display name). group_categories=False plots every category.
+        if not 0.0 <= min_gaze_fraction <= 1.0:
+            raise ValueError("min_gaze_fraction must be between 0 and 1")
+        if max_plot_categories < 1:
+            raise ValueError("max_plot_categories must be at least 1")
+        self.group_categories = group_categories
+        self.min_gaze_fraction = min_gaze_fraction
+        self.max_plot_categories = max_plot_categories
+        self.always_show = tuple(always_show)
         # gaze_aggregate: "none" scores every gaze sample (one output row per gaze sample);
         # "mean"/"median" collapse each frame's gaze samples into one gaze point (one output
         # row per world-camera frame, written to separately named *_per_frame_<mode> files).
@@ -1111,6 +1163,55 @@ class GazeObjectAligner:
             heatmap_row = {cat: i for i, cat in enumerate(heatmap_categories)}
 
         real_categories = [cat for cat in heatmap_categories if cat in real_categories]
+        display_map = category_display_map or {}
+
+        # Pool rarely gazed-at categories (and no_object) into one "other" row per figure.
+        # Rows keep the order chosen above (--category-sort); the pooled row comes last.
+        n_pooled_trajectory = n_pooled_heatmap = 0
+        if self.group_categories:
+            pins = []
+            for name in self.always_show:
+                hits = [c for c in heatmap_categories
+                        if c == name or display_map.get(c) == name]
+                if not hits:
+                    self.logger.warning("--always-show: no category named '%s' in this recording", name)
+                pins.extend(hits)
+
+            # trajectory plot (binary labels): score = fraction of plotted points labelled
+            label_counts = Counter(gaze_categories)
+            kept, other = _select_plot_categories(
+                {c: label_counts.get(c, 0) / len(gaze_categories)
+                 for c in heatmap_categories + (["no_object"] if has_no_object else [])},
+                self.min_gaze_fraction, self.max_plot_categories, pins)
+            self.logger.info(_describe_pooled(
+                "Trajectory plot", other, "fraction of plotted gaze points labelled", display_map))
+            kept_set = set(kept)
+            real_categories = [c for c in heatmap_categories if c in kept_set]
+            gaze_categories = [c if c in kept_set else OTHER_KEY for c in gaze_categories]
+            n_pooled_trajectory = sum(v > 0 for _, v in other)  # categories actually in the row
+            has_no_object = False  # folded into "other"
+
+            # heatmap (confidence): score = mean confidence over the plotted points
+            kept, other = _select_plot_categories(
+                dict(zip(heatmap_categories, confidence_matrix.mean(axis=1))),
+                self.min_gaze_fraction, self.max_plot_categories, pins)
+            self.logger.info(_describe_pooled(
+                "Confidence heatmap", other, "mean confidence over plotted gaze points", display_map))
+            kept_set = set(kept)
+            kept_ordered = [c for c in heatmap_categories if c in kept_set]
+            rows = [confidence_matrix[heatmap_categories.index(c)] for c in kept_ordered]
+            n_pooled_heatmap = sum(v > 0 for _, v in other)
+            if n_pooled_heatmap:  # same rule as merging instances of one category: per-point maximum
+                pooled = [confidence_matrix[heatmap_categories.index(c)] for c, _ in other]
+                rows.append(np.max(pooled, axis=0))
+                kept_ordered.append(OTHER_KEY)
+            heatmap_categories = kept_ordered
+            confidence_matrix = np.vstack(rows) if rows else np.zeros((0, confidence_matrix.shape[1]))
+
+        def _row_label(cat, n_pooled):
+            if cat == OTHER_KEY:
+                return f"other ({n_pooled} categor{'y' if n_pooled == 1 else 'ies'})"
+            return display_map.get(cat, cat)
 
         # "no_object" is not a real gazed object; pin it to the last row with a fixed
         # neutral color instead of letting first-seen/frequency order place it arbitrarily
@@ -1121,8 +1222,9 @@ class GazeObjectAligner:
         heatmap_row = {cat: i for i, cat in enumerate(heatmap_categories)}
 
         category_order = real_categories + (["no_object"] if has_no_object else [])
+        if n_pooled_trajectory:
+            category_order.append(OTHER_KEY)
         category_to_y = {cat: i for i, cat in enumerate(category_order)}
-        display_map = category_display_map or {}
 
         figures_dir = Path(out_dir) / "figures"
         figures_dir.mkdir(parents=True, exist_ok=True)
@@ -1131,7 +1233,7 @@ class GazeObjectAligner:
         trajectory_fig, trajectory_ax = plt.subplots(figsize=(20, trajectory_height))
         cmap = plt.get_cmap("tab20")
         NO_OBJECT_COLOR = (0.55, 0.55, 0.55, 1.0)
-        category_colors = {"no_object": NO_OBJECT_COLOR}
+        category_colors = {"no_object": NO_OBJECT_COLOR, OTHER_KEY: NO_OBJECT_COLOR}
         for idx, cat in enumerate(real_categories):
             category_colors[cat] = cmap(idx % cmap.N)
         y_values = np.array([category_to_y[cat] for cat in gaze_categories], dtype=float)
@@ -1160,7 +1262,7 @@ class GazeObjectAligner:
             rasterized=rasterize,
         )
         trajectory_ax.set_yticks(np.arange(len(category_order)))
-        trajectory_ax.set_yticklabels([display_map.get(cat, cat) for cat in category_order])
+        trajectory_ax.set_yticklabels([_row_label(cat, n_pooled_trajectory) for cat in category_order])
         trajectory_ax.set_xlabel("Time (s)")
         trajectory_ax.set_ylabel("Gazed Category")
         trajectory_ax.set_title(f"Gaze trajectory ({subject_id_temp}, {camera_temp})")
@@ -1190,7 +1292,7 @@ class GazeObjectAligner:
             rasterized=rasterize,
         )
         heatmap_ax.set_yticks(np.arange(len(heatmap_categories)) + 0.5)
-        heatmap_ax.set_yticklabels([display_map.get(cat, cat) for cat in heatmap_categories])
+        heatmap_ax.set_yticklabels([_row_label(cat, n_pooled_heatmap) for cat in heatmap_categories])
         heatmap_ax.set_xlabel("Time (s)")
         heatmap_ax.set_ylabel("Gazed Category")
         heatmap_ax.set_title(f"Gaze confidence heatmap ({subject_id_temp}, {camera_temp})")
@@ -1785,6 +1887,7 @@ def process_subject_camera_pair(args):
         pipeline,
         vector_figures,
         gaze_aggregate,
+        group_opts,
     ) = args
 
     setup_worker_logging(log_queue)
@@ -1809,6 +1912,7 @@ def process_subject_camera_pair(args):
         pipeline=pipeline,
         vector_figures=vector_figures,
         gaze_aggregate=gaze_aggregate,
+        **group_opts,
     )
     logger.info("Processing started.")
     gaze_aligner.process_subject(subject_id_temp, camera_temp)
@@ -1997,6 +2101,36 @@ def main():
              'and is written to *_per_frame_<mode> files so it never overwrites per-sample output.',
     )
 
+    parser.add_argument(
+        '--min-gaze-fraction',
+        type=float,
+        default=0.03,
+        help='Figure rows: a category gets its own row if its mean score over the plotted gaze '
+             'points is at least this (0-1). In the trajectory plot the score is 1 for points '
+             'labelled with the category, so the mean is the fraction of points labelled with '
+             'it; in the confidence heatmap it is the category\'s confidence, so the mean also '
+             'counts partial overlaps with the gaze disk. Categories below it (and no_object) '
+             'are pooled into one "other" row, whose members are logged. Default 0.03.',
+    )
+    parser.add_argument(
+        '--max-plot-categories',
+        type=int,
+        default=12,
+        help='Maximum number of own rows per figure (the pooled "other" row is extra). '
+             'Categories pinned with --always-show always count. Default 12.',
+    )
+    parser.add_argument(
+        '--always-show',
+        default='',
+        help='Comma-separated categories that always get their own row, whatever their score '
+             '(category name such as "head_parent_head", or the instance name "parent_head").',
+    )
+    parser.add_argument(
+        '--no-group-categories',
+        action='store_true',
+        help='Plot every category as its own row (no "other" row).',
+    )
+
     args = parser.parse_args()
 
     if args.num_workers < 1:
@@ -2005,6 +2139,10 @@ def main():
         parser.error("--within-job-workers must be >= 1.")
     if args.start_plot_time is not None and args.start_plot_time < 0:
         parser.error("--start-plot-time must be >= 0.")
+    if not (0.0 <= args.min_gaze_fraction <= 1.0):
+        parser.error("--min-gaze-fraction must be between 0.0 and 1.0.")
+    if args.max_plot_categories < 1:
+        parser.error("--max-plot-categories must be >= 1.")
     if not (0.0 <= args.gaze_confidence_threshold <= 1.0):
         parser.error("--gaze-confidence-threshold must be between 0.0 and 1.0.")
     if args.gaze_radius < 1:
@@ -2098,6 +2236,13 @@ def main():
         logger.info(f"Category Sort: {args.category_sort}")
         logger.info(f"Gaze Radius (px): {args.gaze_radius}")
         logger.info(f"Gaze Aggregate: {args.gaze_aggregate}")
+        group_opts = dict(
+            group_categories=not args.no_group_categories,
+            min_gaze_fraction=args.min_gaze_fraction,
+            max_plot_categories=args.max_plot_categories,
+            always_show=tuple(n.strip() for n in args.always_show.split(',') if n.strip()),
+        )
+        logger.info(f"Figure category grouping: {group_opts}")
         logger.info(f"Queue Logging: {use_queue_logging}")
         if args.blink_dir is None:
             logger.info("No blink directory provided, skipping blink labeling.")
@@ -2126,6 +2271,7 @@ def main():
                     pipeline=args.pipeline,
                     vector_figures=args.vector_figures,
                     gaze_aggregate=args.gaze_aggregate,
+                    **group_opts,
                 )
                 gaze_aligner.process_subject(subj, cam)
                 logger.info(f"------- Finished processing subject {subj}, camera {cam} -------")
@@ -2155,6 +2301,7 @@ def main():
                     args.pipeline,
                     args.vector_figures,
                     args.gaze_aggregate,
+                    group_opts,
                 )
                 for subj, cam in subject_camera_pairs
             ]
