@@ -19,6 +19,7 @@ import re
 import argparse
 import colorsys
 from collections import deque
+import gaze_overlay
 
 # Import utility functions
 from utils import (
@@ -234,6 +235,7 @@ class SAM2VideoUI:
         self.zoom_center_img_y = 0.5  # Zoom center as fraction of image height (0.0-1.0)
 
         self.click_points = []  # Store click coordinates with object IDs
+        self.gaze_points_by_frame = None  # {frame_idx: [(x, y), ...]} from a loaded gaze CSV
         self.masks = {}  # Store masks for each frame {frame_idx: {obj_id: mask}}
         self.has_segmentation = False  # Track if segmentation has been completed or loaded
         self.playing = False
@@ -254,6 +256,9 @@ class SAM2VideoUI:
         # SAM2 objects declared "covered by SAM3" — read-only, masks are union of sub-ids
         # {int_id: {"name": str, "color": list, "sam3_sub_ids": list[int]}}
         self.sam2_covered_ids: dict = {}
+        # SAM2 ids of SAM3 instances deleted in the SAM3 project (handoff "retired_ids").
+        # Reserved: never reused for a new object and not annotatable here.
+        self.sam3_retired_ids: set = set()
 
         # Multi-frame annotation mode (always enabled)
         self.multi_frame_annotation_mode = True
@@ -524,7 +529,11 @@ class SAM2VideoUI:
                   command=self.import_annotations, width=15).pack(fill=tk.X, pady=2)
         ttk.Button(file_frame, text="Export Annotations",
                   command=self.export_annotations, width=15).pack(fill=tk.X, pady=2)
-        
+
+        self.gaze_button = ttk.Button(file_frame, text="Load Gaze CSV",
+                  command=self.load_gaze_csv, width=15)
+        self.gaze_button.pack(fill=tk.X, pady=2)
+
         # Object Annotation
         obj_frame = ttk.LabelFrame(scrollable_frame, text="Object Annotation", padding=10)
         obj_frame.pack(fill=tk.X, pady=(0, 10))
@@ -543,9 +552,10 @@ class SAM2VideoUI:
                                         bg='#404040', fg='white', insertbackground='white')
         self.object_spinbox.pack(side=tk.LEFT, padx=(5, 5))
 
-        # Object color indicator
-        self.object_color_label = ttk.Label(current_obj_frame, text="",
-                                           foreground='cyan', font=('Arial', 16))
+        # Object color indicator (a real colored swatch - the unicode block char
+        # renders as an empty box in the default Linux Tk font)
+        self.object_color_label = tk.Label(current_obj_frame, text="  ",
+                                           relief=tk.SOLID, borderwidth=1)
         self.object_color_label.pack(side=tk.LEFT, padx=(5, 0))
 
         # Object name entry
@@ -592,6 +602,9 @@ class SAM2VideoUI:
 
         self.object_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # SAM3-covered objects are read-only in this UI - show them greyed out
+        self.object_tree.tag_configure("covered", foreground="gray")
 
         self.object_tree.bind('<ButtonRelease-1>', self.on_object_tree_select)
 
@@ -1208,12 +1221,17 @@ class SAM2VideoUI:
 
             # Insert into tree (show [SAM3] and/or * markers)
             display_name = self.object_names[obj_id]
-            if obj_id in self.sam3_object_ids:
+            row_tags = ()
+            if obj_id in self.sam2_covered_ids:
+                display_name += " [SAM3-covered]"
+                row_tags = ("covered",)
+            elif obj_id in self.sam3_object_ids:
                 display_name += " [SAM3]"
             if obj_id in self.updated_objects:
                 display_name += " *"
             item = self.object_tree.insert("", "end", text=str(obj_id),
-                                          values=(display_name, point_count))
+                                          values=(display_name, point_count),
+                                          tags=row_tags)
             
             # Highlight current object
             if obj_id == self.current_object_id:
@@ -1313,6 +1331,44 @@ class SAM2VideoUI:
         except Exception as e:
             messagebox.showerror("Export Error", f"Failed to export object list: {str(e)}")
     
+    def load_gaze_csv(self):
+        """Load a gaze CSV + world-timestamps CSV and overlay the gaze position."""
+        if self.gaze_points_by_frame is not None:
+            choice = messagebox.askyesnocancel(
+                "Gaze Data Loaded",
+                f"Gaze data is already loaded ({len(self.gaze_points_by_frame)} frames).\n\n"
+                "Yes = load a different pair of CSVs\nNo = clear the current gaze overlay",
+            )
+            if choice is None:
+                return
+            if choice is False:
+                self.gaze_points_by_frame = None
+                self.gaze_button.config(text="Load Gaze CSV")
+                self.display_current_frame()
+                return
+
+        gaze_path = filedialog.askopenfilename(
+            title="Select gaze CSV (timestamp [ns], gaze x [px], gaze y [px])",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        if not gaze_path:
+            return
+        world_path = filedialog.askopenfilename(
+            title="Select world-timestamps CSV (one row per video frame, timestamp [ns])",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        if not world_path:
+            return
+
+        try:
+            mapping = gaze_overlay.load_gaze_csv(gaze_path, world_path)
+        except Exception as e:
+            messagebox.showerror("Load Gaze CSV Failed", str(e))
+            return
+
+        self.gaze_points_by_frame = mapping
+        self.gaze_button.config(text="Gaze CSV: reload / clear")
+        messagebox.showinfo("Gaze CSV Loaded", gaze_overlay.summarize(mapping))
+        self.display_current_frame()
+
     def export_annotations(self):
         """Export click point annotations to JSON file"""
         if not self.click_points:
@@ -1809,6 +1865,7 @@ class SAM2VideoUI:
             # their masks are the union of sam3_sub_ids computed at sam2_process time).
             covered_raw = handoff.get("sam2_covered_ids", {})
             self.sam2_covered_ids = {int(k): v for k, v in covered_raw.items()}
+            self.sam3_retired_ids = {int(k) for k in handoff.get("retired_ids", {})}
             for cid, info in self.sam2_covered_ids.items():
                 self.sam3_object_ids.add(cid)
                 self.object_names[cid] = info.get("name", f"Object_{cid}")
@@ -1823,7 +1880,9 @@ class SAM2VideoUI:
                 for frame_idx in range(num_frames)
             }
 
-            all_ids_in_handoff = set(int(k) for k in mapping) | set(self.sam2_covered_ids)
+            # Include retired ids so add_new_object() never reuses one.
+            all_ids_in_handoff = (set(int(k) for k in mapping) | set(self.sam2_covered_ids)
+                                  | self.sam3_retired_ids)
             self.max_object_id = max(all_ids_in_handoff) if all_ids_in_handoff else 1
             self.object_var.set(self.current_object_id)
             self.object_spinbox.config(to=self.max_object_id)
@@ -2717,9 +2776,12 @@ class SAM2VideoUI:
 
     def update_object_color_display(self):
         """Update the color indicator for the current object"""
-        color = self.object_colors[self.current_object_id]
-        # Display a colored square using unicode block character
-        self.object_color_label.config(text="■", foreground=self._rgb_to_hex(color))
+        if self.current_object_id in self.sam2_covered_ids:
+            # SAM3-covered object: read-only here, shown greyed out
+            self.object_color_label.config(background='#808080')
+        else:
+            color = self.object_colors[self.current_object_id]
+            self.object_color_label.config(background=self._rgb_to_hex(color))
     def add_new_object(self):
         """Add a new object for segmentation"""
         self.max_object_id += 1
@@ -3813,6 +3875,12 @@ class SAM2VideoUI:
                             (int(x + line_length), int(y)),
                             (255, 255, 255), line_thickness)
 
+        # Gaze position overlay (drawn in native image coords; scaled with the frame)
+        if self.gaze_points_by_frame:
+            gaze_pts = self.gaze_points_by_frame.get(self.current_frame_idx)
+            if gaze_pts:
+                gaze_overlay.draw_gaze_marker(display_frame, gaze_pts)
+
         # Convert to PIL and display
         pil_image = Image.fromarray(display_frame)
 
@@ -4129,7 +4197,11 @@ class SAM2VideoUI:
 
         if self.current_object_id in self.sam3_object_ids:
             self.status_label.config(
-                text=f"Object {self.current_object_id} was segmented by SAM3 — select a different object to annotate.")
+                text=f"Object {self.current_object_id} was segmented by SAM3 - select a different object to annotate.")
+            return
+        if self.current_object_id in self.sam3_retired_ids:
+            self.status_label.config(
+                text=f"Object id {self.current_object_id} belonged to a deleted SAM3 instance and is reserved - select a different object to annotate.")
             return
 
         # Get canvas coordinates
@@ -5407,8 +5479,8 @@ class SAM2VideoUI:
             _use_npz = messagebox.askyesno(
                 "Mask Output Format",
                 "Save masks as NPZ bundles?\n\n"
-                "[Yes] NPZ  — one compressed file per frame (~5× smaller)\n"
-                "[No]  PNG  — one file per object per frame (default)"
+                "[Yes] NPZ  - one compressed file per frame (~5x smaller)\n"
+                "[No]  PNG  - one file per object per frame (default)"
             )
             _mask_format = "npz" if _use_npz else "png"
             print(f"Mask format chosen by user: {_mask_format.upper()}")
@@ -6060,7 +6132,7 @@ class SAM2VideoUI:
                 messagebox.showwarning(
                     "No Updated Annotations",
                     f"No updated annotation points found in frames "
-                    f"{start_frame + 1}–{end_frame + 1}.\n\n"
+                    f"{start_frame + 1}-{end_frame + 1}.\n\n"
                     f"All objects in this range are unchanged since the last segmentation. "
                     f"No re-segmentation needed."
                 )
@@ -7721,6 +7793,27 @@ class SAM2VideoUI:
         cache_key = (frame_idx, obj_id)
         if cache_key in self.mask_cache:
             return self.mask_cache[cache_key]
+
+        # SAM2 covered-by-SAM3 IDs: mask is the pixel-wise union of the referenced
+        # SAM3 sub-instance masks (mirrors sam2_process.py covered-union computation).
+        covered_info = self.sam2_covered_ids.get(obj_id)
+        if covered_info is not None:
+            # Retired sub-ids are deleted SAM3 instances: no longer part of the union
+            # (sam2_process.py skips them too, as they are absent from sam3_mask_dirs).
+            sub_ids = [int(s) for s in covered_info.get("sam3_sub_ids", [])
+                       if int(s) not in self.sam3_retired_ids]
+            union = None
+            for sub_id in sub_ids:
+                sub_mask = self._load_mask(frame_idx, sub_id)
+                if sub_mask is None:
+                    continue
+                sub_bin = (sub_mask > 0)
+                union = sub_bin if union is None else (union | sub_bin)
+            if union is None:
+                return None
+            mask = (union.astype(np.uint8) * 255)
+            self._cache_mask(cache_key, mask)
+            return mask
 
         # Check SAM3 native mask paths first
         if obj_id in self.sam3_mask_dirs:

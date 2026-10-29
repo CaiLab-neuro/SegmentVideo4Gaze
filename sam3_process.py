@@ -282,7 +282,7 @@ def process_project_parallel(args, project, concepts_to_process, devices):
     # Completeness-checked: resumes if a previous extraction was killed midway.
     from sam3_utils import ensure_frames_extracted
     frames_dir = ensure_frames_extracted(
-        project.video_path, project.get_frames_dir(), project.num_frames)
+        project.get_video_path(), project.get_frames_dir(), project.num_frames)
 
     n_workers = min(args.parallel, len(concepts_to_process))
     print(f"\nStarting {n_workers} worker(s) on device(s): {', '.join(devices)}")
@@ -398,6 +398,72 @@ def process_project_parallel(args, project, concepts_to_process, devices):
     return 1 if errors else 0
 
 
+def _finalize_concept_refinement(concept, project_dir):
+    """
+    Post-processing shared by the serial (_refine_project_impl) and parallel
+    (_parallel_refine_worker_main) `--refine` paths, run after
+    replay_concept_refinements() succeeds for a concept.
+
+    1. Drops merge-absorbed source instances from metadata — their masks were
+       already deleted by the pipeline, so keeping stale entries around risks
+       obj_id collisions with SAM3's own detector on a future redetect.
+    2. Marks the concept COMPLETED once no live instance has any unpropagated
+       refinements.json entry left. process_concept_detection is otherwise the
+       only place that ever sets ConceptStatus.COMPLETED, so a concept whose
+       instances were all manually added (never ran text-prompt detection) or
+       that errored out after an earlier detection run would otherwise stay
+       "pending"/"error" forever even once fully refined. This mirrors the
+       same check handle_status() already uses for its [REFINEMENT NEEDED]
+       listing, so --status agrees with what actually happened.
+
+    Mutates `concept` in place. Does not save/persist anything — callers own
+    that (project.save() vs. project._save_concept_metadata()) and their own
+    logging style (plain print vs. worker-tagged print).
+
+    Returns (absorbed_ids_removed: set[int], marked_completed: bool).
+    """
+    absorbed_ids_removed = {
+        inst.sam3_obj_id for inst in concept.instances
+        if inst.deleted and getattr(inst, 'absorbed_source', False)
+    }
+    if absorbed_ids_removed:
+        concept.instances = [
+            inst for inst in concept.instances
+            if not (inst.deleted and getattr(inst, 'absorbed_source', False))
+        ]
+        for inst in concept.instances:
+            inst.absorbed_source_ids = [
+                sid for sid in inst.absorbed_source_ids
+                if sid not in absorbed_ids_removed
+            ]
+
+    still_pending = False
+    for inst in concept.instances:
+        if inst.deleted:
+            continue
+        rpath = os.path.join(
+            project_dir, "concepts", concept.name,
+            "instances", str(inst.sam3_obj_id), "refinements.json"
+        )
+        if not os.path.exists(rpath):
+            continue
+        with open(rpath) as f:
+            refs = json.load(f).get("refinements", [])
+        if any(not r.get("propagated", True) for r in refs):
+            still_pending = True
+            break
+
+    marked_completed = False
+    if not still_pending and concept.status.value != "completed":
+        from sam3_project import ConceptStatus
+        from datetime import datetime
+        concept.status = ConceptStatus.COMPLETED
+        concept.completed_at = datetime.now().isoformat()
+        marked_completed = True
+
+    return absorbed_ids_removed, marked_completed
+
+
 def _parallel_refine_worker_main(
     worker_id, device, project_dir, model_name, use_fa3, max_cond_frames_in_attn,
     restore_cond_states, save_cond_states, save_obj_ptr_prior, preload_original_masks,
@@ -500,22 +566,13 @@ def _parallel_refine_worker_main(
                     preload_original_masks=preload_original_masks,
                     new_instance_policy=new_instance_policy,
                 )
-                # Remove absorbed sources from the concept before saving metadata,
-                # mirroring the cleanup done in _refine_project_impl for the serial path.
-                absorbed_ids_removed = {
-                    inst.sam3_obj_id for inst in concept.instances
-                    if inst.deleted and getattr(inst, 'absorbed_source', False)
-                }
+                absorbed_ids_removed, marked_completed = _finalize_concept_refinement(
+                    concept, project_dir)
                 if absorbed_ids_removed:
-                    concept.instances = [
-                        inst for inst in concept.instances
-                        if not (inst.deleted and getattr(inst, 'absorbed_source', False))
-                    ]
-                    for inst in concept.instances:
-                        inst.absorbed_source_ids = [
-                            sid for sid in inst.absorbed_source_ids
-                            if sid not in absorbed_ids_removed
-                        ]
+                    print(f"{tag} removed {len(absorbed_ids_removed)} absorbed source(s) from "
+                          f"project metadata: obj_ids {sorted(absorbed_ids_removed)}")
+                if marked_completed:
+                    print(f"{tag} concept '{cname}' has no pending annotations left — marking completed.")
                 # Persist updated presence fields and cleaned-up instance list.
                 project._save_concept_metadata(concept)
             result_queue.put(("done", worker_id, cname))
@@ -605,6 +662,20 @@ def refine_project_parallel(args, project, redetect_concepts, refine_concepts, d
         if msg_type == "done":
             remaining -= 1
             cname = payload
+            # Workers write the authoritative concepts/<name>/concept_metadata.json
+            # directly but never send the mutated concept back over the queue, so
+            # the parent's in-memory copy is still the stale pre-refine version.
+            # Re-read it now (mirroring process_project_parallel's merge-back)
+            # so the project.json summary this function's caller saves below
+            # reflects what the worker actually wrote, not stale status/counts.
+            updated = project._load_concept_metadata(cname)
+            if updated is not None:
+                for idx, c in enumerate(project.concepts):
+                    if c.name == cname:
+                        project.concepts[idx] = updated
+                        break
+                else:
+                    project.add_concept(updated)
             print(f"[refine-worker {worker_id}] done: '{cname}' ({remaining} remaining)")
         elif msg_type == "error":
             remaining -= 1
@@ -851,13 +922,17 @@ def handle_delete_frames(args):
 
 
 def handle_quality_metrics(args):
-    """Handle --quality-metrics: compute and save quality_metrics.npz for the project."""
+    """Compute and save quality_metrics.npz for the project.
+
+    Runs by default after detection / --refine / --redo / --reset;
+    suppressed by --no-quality-metrics.
+    """
     project = _load_project(args.project)
     if project is None:
         return 1
 
     from sam3_utils import build_sam3_masks_metadata
-    from utils import calculate_quality_metrics, save_quality_metrics
+    from utils import calculate_quality_metrics_grouped, save_quality_metrics_grouped
 
     print(f"Calculating quality metrics for project: {args.project}")
     masks_by_frame, load_fn, obj_id_to_info = build_sam3_masks_metadata(project)
@@ -868,20 +943,32 @@ def handle_quality_metrics(args):
 
     print(f"Found {len(obj_id_to_info)} object(s) across {len(masks_by_frame)} frame(s).")
     width, height = project.frame_dimensions
-    inter, bg, overlap = calculate_quality_metrics(
+
+    # Inter-frame change is computed per concept; overlap is a per-concept
+    # one-vs-rest cross-concept ratio (fraction of the concept's area also claimed
+    # by another concept). Background ratio stays global.
+    obj_id_to_group = {oid: info["concept"] for oid, info in obj_id_to_info.items()}
+    result = calculate_quality_metrics_grouped(
         masks=masks_by_frame,
         load_mask_func=load_fn,
+        obj_id_to_group=obj_id_to_group,
         frame_dimensions=(height, width),
         num_frames=project.num_frames,
     )
-    save_quality_metrics(args.project, inter, bg, overlap)
+    save_quality_metrics_grouped(args.project, result)
 
     def _mean(lst):
         return sum(lst) / len(lst) if lst else float("nan")
 
-    print(f"Inter-frame change (mean): {_mean(inter):.3f}")
-    print(f"Background ratio   (mean): {_mean(bg):.3f}")
-    print(f"Overlap ratio      (mean): {_mean(overlap):.3f}")
+    print(f"Background ratio         (mean, global): {_mean(result['background_ratios']):.3f}")
+    for g in result['group_names']:
+        print(f"Concept '{g}':")
+        print(f"  Inter-frame change     (mean): {_mean(result['inter_frame_changes_by_group'][g]):.3f}")
+        print(f"  Overlap vs other concepts (mean): {_mean(result['overlap_ratios_by_group'][g]):.3f}")
+    _grp_overlap_means = [_mean(result['overlap_ratios_by_group'][g]) for g in result['group_names']]
+    print(f"Inter-frame change (mean, all concepts combined): {_mean(result['inter_frame_changes']):.3f}")
+    print(f"Overlap vs other concepts (mean over concepts): {_mean(_grp_overlap_means):.3f}")
+    print(f"Global excess-assignment overlap (backward-compat): {_mean(result['overlap_ratios']):.3f}")
     print(f"Saved: {os.path.join(args.project, 'quality_metrics.npz')}")
     return 0
 
@@ -988,15 +1075,19 @@ def handle_export_sam2(args):
             print("WARNING: Could not read existing sam2_handoff.json — creating fresh.")
 
     existing_mapping: dict = existing_handoff.get("object_mapping", {})
+    # SAM2 ids of SAM3 instances deleted after an earlier export. They stay reserved (never
+    # handed to another object, so older outputs stay unambiguous) and are reinstated if the
+    # instance is restored in SAM3.
+    existing_retired: dict = existing_handoff.get("retired_ids", {})
     # Build reverse lookup: (concept_name, sam3_obj_id) → sam2_obj_id
     reverse_lookup: dict = {}
-    for sam2_id_str, entry in existing_mapping.items():
+    for sam2_id_str, entry in list(existing_retired.items()) + list(existing_mapping.items()):
         key = (entry.get("concept"), entry.get("instance_id"))
         reverse_lookup[key] = int(sam2_id_str)
 
     # IDs reserved in the handoff or the CSV — auto-assign always stays above max(csv_ids)
     # so gaps in the CSV (unassigned SAM2 objects) remain available for SAM2 to use natively.
-    reserved_ids: set = {int(k) for k in existing_mapping}
+    reserved_ids: set = {int(k) for k in existing_mapping} | {int(k) for k in existing_retired}
     if csv_name_map:
         reserved_ids.update(e["id"] for e in csv_name_map.values())
 
@@ -1010,6 +1101,7 @@ def handle_export_sam2(args):
 
     next_id = _next_free_id(reserved_ids)
     new_mapping: dict = dict(existing_mapping)
+    new_retired: dict = dict(existing_retired)
     new_colors: dict = dict(existing_handoff.get("object_colors", {}))
     # Track which CSV IDs were consumed (by direct name-match or interactive merge-into)
     used_csv_ids: set = set()
@@ -1078,6 +1170,8 @@ def handle_export_sam2(args):
                 reserved_ids.add(sam2_id)
                 next_id = _next_free_id(reserved_ids)
 
+            if new_retired.pop(str(sam2_id), None) is not None:
+                print(f"  Restored '{inst.user_name}' (concept={concept.name}) -> SAM2 id {sam2_id}")
             new_mapping[str(sam2_id)] = {
                 "concept": concept.name,
                 "instance_id": inst.sam3_obj_id,
@@ -1086,6 +1180,14 @@ def handle_export_sam2(args):
                 "mask_filename_pattern": "{frame:06d}." + mask_format,
             }
             new_colors[str(sam2_id)] = list(color)
+
+    # Retire mapping entries whose SAM3 instance was deleted (or whose concept is gone),
+    # so sam2_ui.py / sam2_process.py stop using them; their ids stay reserved.
+    from sam3_utils import retire_deleted_handoff_ids
+    new_mapping, new_retired, retire_messages = retire_deleted_handoff_ids(
+        project, new_mapping, new_retired, new_covered)
+    for message in retire_messages:
+        print(f"  {message}")
 
     # Warn about cross-concept name duplicates
     for name, locs in seen_names_global.items():
@@ -1166,6 +1268,7 @@ def handle_export_sam2(args):
         "object_mapping": new_mapping,
         "object_colors": new_colors,
         "sam2_covered_ids": new_covered,
+        "retired_ids": new_retired,
         "sam2_results_subdir": "sam2_results",
     }
     with open(handoff_path, "w") as f:
@@ -1174,9 +1277,6 @@ def handle_export_sam2(args):
     n = len(new_mapping)
     print(f"sam2_handoff.json written: {n} SAM2 object(s) → {handoff_path}")
     print(f"Open in sam2_ui.py: File → Import Masks → {args.project}")
-
-    if getattr(args, "quality_metrics", False):
-        return handle_quality_metrics(args)
     return 0
 
 
@@ -1546,7 +1646,7 @@ def _refine_project_impl(args, project):
 
     from sam3_utils import ensure_frames_extracted
     resource_path = ensure_frames_extracted(
-        project.video_path, project.get_frames_dir(), project.num_frames)
+        project.get_video_path(), project.get_frames_dir(), project.num_frames)
 
     if concepts_to_redetect:
         print(f"\nFound {len(concepts_to_redetect)} concept(s) flagged for full re-detection:")
@@ -1707,25 +1807,13 @@ def _refine_project_impl(args, project):
                 preload_original_masks=args.preload_original_masks,
                 new_instance_policy=args.new_instance_policy,
             )
-            # Refinement succeeded: absorbed sources have been incorporated into the
-            # target's anchor-based propagation and their original mask files have been
-            # deleted by the pipeline.  Remove them from project metadata now so their
-            # obj_ids are free to be reused without confusion on future redetections.
-            absorbed_ids_removed = set()
-            concept.instances = [
-                inst for inst in concept.instances
-                if not (inst.deleted and getattr(inst, 'absorbed_source', False))
-                or absorbed_ids_removed.add(inst.sam3_obj_id) or False
-            ]
+            absorbed_ids_removed, marked_completed = _finalize_concept_refinement(
+                concept, project.project_dir)
             if absorbed_ids_removed:
-                # Prune stale IDs from any target's absorbed_source_ids list
-                for inst in concept.instances:
-                    inst.absorbed_source_ids = [
-                        sid for sid in inst.absorbed_source_ids
-                        if sid not in absorbed_ids_removed
-                    ]
                 print(f"  Removed {len(absorbed_ids_removed)} absorbed source(s) from "
                       f"project metadata: obj_ids {sorted(absorbed_ids_removed)}")
+            if marked_completed:
+                print(f"  Concept '{cname}' has no pending annotations left — marking completed.")
         except Exception as e:
             errors.append((cname, str(e)))
             print(f"  Error refining concept '{cname}': {e}")
@@ -1968,8 +2056,8 @@ def handle_status(args):
             print(f"\n  [OPTIONAL] Export to SAM2 handoff for use in sam2_ui.py:")
             print(f"    {script} {proj_arg} --export-sam2")
         if not os.path.exists(metrics):
-            print(f"\n  [OPTIONAL] Compute quality metrics:")
-            print(f"    {script} {proj_arg} --quality-metrics")
+            print(f"\n  [OPTIONAL] (Re)compute quality metrics:")
+            print(f"    {script} {proj_arg}")
 
     if lock_info:
         elapsed = int(_time_mod.time() - lock_info.get("started", _time_mod.time()))
@@ -2070,17 +2158,18 @@ def main():
                              "for 1600x1200 video). Lower values save RAM on slow machines.")
     parser.add_argument("--max-cond-frames", type=int, default=-1,
                         dest="max_cond_frames_in_attn",
-                        help="Number of conditioning frames the tracker attends to per "
-                             "forward pass (default: -1 = no limit, matching SAM3's "
-                             "built-in default).  All user correction anchors are always "
-                             "attended to.  Set to a small positive value (e.g. 4-8) to "
-                             "bound attention compute AND GPU memory when a concept has "
-                             "many annotation/mask-anchor frames: cond frames outside the "
-                             "selected window are also offloaded to CPU between propagation "
-                             "steps (see _offload_unselected_cond_frames in sam3_pipeline.py) "
-                             "and transparently reloaded onto GPU only when propagation "
-                             "comes back near them. At -1 this offload is a no-op, since "
-                             "every cond frame is always in the selected window.")
+                        help="How many conditioning frames (annotated frames, mask anchors "
+                             "and automatic re-anchors) the tracker attends to when "
+                             "propagating each frame.  -1 = all of them, so every annotation "
+                             "influences every frame, but attention compute and GPU memory "
+                             "grow with the number of annotated frames in a concept.  A "
+                             "positive N = only the N temporally nearest; the others stay "
+                             "saved (offloaded to CPU) and are attended to again when "
+                             "propagation comes near them, so memory stays bounded however "
+                             "many frames are annotated.  Default: -1 for this program; "
+                             "upstream SAM3's builder uses 4.  Explore what works best for "
+                             "your videos; reducing it (e.g. 4-16) may be necessary on GPUs "
+                             "with little VRAM or for heavily annotated concepts.")
     parser.add_argument("--device", default="cuda:0",
                         help="Device, comma-separated list, or 'all' to use every available GPU "
                              "(e.g. cuda:2, cuda:2,cuda:3, or all). Default: cuda:0")
@@ -2111,15 +2200,17 @@ def main():
                              "redetection under its own id is simply left untouched, rather than "
                              "silently reinforced with stale prior-round content the user never "
                              "sees.")
-    parser.add_argument("--new-instance-policy", default="allow",
+    parser.add_argument("--new-instance-policy", default="disallow",
                         choices=["allow", "latent", "disallow"], dest="new_instance_policy",
                         help="What to do with an object first detected mid-video during "
                              "--refine (not present at the initial detection frame, not a "
-                             "known live/deleted/absorbed instance). 'allow' (default): "
-                             "promote it to a new instance under a freshly assigned id. "
-                             "'latent': let it keep tracking/competing for the rest of this "
-                             "run but never persist or promote it. 'disallow': cap SAM3's "
-                             "max_num_objects so it can never be created in the first place.")
+                             "known live instance). 'disallow' (default): cap SAM3's "
+                             "max_num_objects so it can never be created, so refinement never "
+                             "adds instances beyond those kept during annotation. 'latent': let "
+                             "it keep tracking/competing for the rest of this run but never "
+                             "persist or promote it. 'allow': promote it to a new instance under "
+                             "a freshly assigned id; note that instances deleted in the UI are "
+                             "re-detected and come back as new instances under this policy.")
     parser.add_argument("--save-cond-states", action="store_true", dest="save_cond_states",
                         help="Save maskmem cond-frame states to concepts/<name>/cond_states/ "
                              "after detection/refinement, for a future --restore-cond round. "
@@ -2160,11 +2251,12 @@ def main():
                              "(exact match).  Unmatched instances are resolved interactively: "
                              "assign new ID, merge into an existing ID, or discard.  Without this "
                              "flag, all new instances are auto-assigned fresh IDs.")
-    parser.add_argument("--quality-metrics", action="store_true", dest="quality_metrics",
-                        help="Compute inter-frame-change / background-ratio / overlap-ratio "
-                             "metrics for all masks in the project and save quality_metrics.npz "
-                             "to the project directory.  Can be combined with --refine or "
-                             "--export-sam2 to compute metrics after those operations finish.")
+    parser.add_argument("--no-quality-metrics", action="store_true", dest="no_quality_metrics",
+                        help="Skip the quality-metrics computation that otherwise runs by "
+                             "default after detection / --refine / --redo / --reset.  By "
+                             "default those operations compute inter-frame-change / "
+                             "background-ratio / overlap-ratio metrics for all masks in the "
+                             "project and save quality_metrics.npz to the project directory.")
     parser.add_argument("--status", action="store_true",
                         help="Print a summary of the project: concepts, instances, pending "
                              "refinements/re-detection, available CUDA devices, and suggested "
@@ -2211,31 +2303,33 @@ def main():
         return export_project(args)
 
     if args.export_sam2:
-        rc = handle_export_sam2(args)
-        if rc == 0 and args.quality_metrics:
-            return handle_quality_metrics(args)
-        return rc
+        # No quality-metrics recompute here: --export-sam2 only writes sam2_handoff.json
+        # and never changes SAM3 masks, so quality_metrics.npz from detection/refine
+        # still applies.
+        return handle_export_sam2(args)
+
+    want_quality = not args.no_quality_metrics
 
     if args.redo is not None:
         rc = redo_project(args)
-        if rc == 0 and args.quality_metrics:
+        if rc == 0 and want_quality:
             return handle_quality_metrics(args)
         return rc
 
     if args.reset is not None:
         rc = reset_project(args)
-        if rc == 0 and args.quality_metrics:
+        if rc == 0 and want_quality:
             return handle_quality_metrics(args)
         return rc
 
     if args.refine is not None:
         rc = refine_project(args)
-        if rc == 0 and args.quality_metrics:
+        if rc == 0 and want_quality:
             return handle_quality_metrics(args)
         return rc
 
     rc = process_project(args)
-    if rc == 0 and args.quality_metrics:
+    if rc == 0 and want_quality:
         return handle_quality_metrics(args)
     return rc
 

@@ -45,12 +45,20 @@ def _atomic_json_dump(data, path: str, indent: int = 2) -> None:
     (OOM-killer, Ctrl-C, power loss) leaves truncated JSON and the next
     json.load raises — for project.json that makes the whole project
     unopenable. os.replace is atomic on the same filesystem.
+
+    tempfile.mkstemp() always creates its file mode 0600 (owner-only),
+    ignoring the process umask by design. os.replace() preserves that mode,
+    so without the explicit chmod below every file written through here
+    would end up unreadable/unwritable by the rest of the group even when
+    the caller has set a group-friendly umask (e.g. 0o002) for everything
+    else.
     """
     dir_name = os.path.dirname(path) or "."
     fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
     try:
         with os.fdopen(fd, 'w') as f:
             json.dump(data, f, indent=indent)
+        os.chmod(tmp_path, 0o664)
         os.replace(tmp_path, path)
     except BaseException:
         try:
@@ -131,10 +139,11 @@ class SAM3Instance:
     sam2_object_id: Optional[int] = None  # SAM2 object ID assigned during export
     # Maximal runs of consecutive frames that have a mask: [(start, end), ...] inclusive
     continuous_periods: List[Tuple[int, int]] = field(default_factory=list)
-    # Best (peak-area) frame per period, computed during propagation while masks are in memory.
-    # Each entry: {"start": int, "end": int, "best_frame": int, "pixel_count": int,
+    # Mask-area stats per period, computed during propagation while masks are in memory.
+    # Each entry: {"start": int, "end": int,
     #              "avg_pixel_ratio": float, "min_pixel_ratio": float, "max_pixel_ratio": float}
     # pixel_ratio fields absent on entries from older project.json files — use .get(..., 0.0).
+    # Older files may also carry "best_frame"/"pixel_count" keys, which are ignored.
     period_peaks: List[dict] = field(default_factory=list)
     # 99th-percentile pixel ratio across all detected frames; used to normalize presence bar
     # height so typical frames read near full height rather than relative to the single maximum.
@@ -314,6 +323,14 @@ class SAM3Project:
     mjpeg_video_path: Optional[str] = None  # Re-encoded MJPEG video if created
     frames_dir: Optional[str] = None        # Persistent extracted-frame directory (JPEGs)
     mask_format: str = "png"  # "png" or "npz" — applies to all mask saves in this project
+    # Path to the concept→instance-name vocabulary JSON last associated with this project.
+    # The UI auto-loads it on project open (re-reading the file each time, so external
+    # edits are picked up). None if no vocabulary has been linked.
+    vocabulary_path: Optional[str] = None
+    # Last gaze CSV / world-timestamps CSV pair loaded for this project. The UI auto-loads
+    # this pair on project open (re-reading the files each time) if both still exist.
+    gaze_csv_path: Optional[str] = None
+    gaze_world_path: Optional[str] = None
     # Alternative locations tried when the primary video/frames paths are unreachable.
     # Populated automatically by the UI when the user manually locates a missing file.
     # Stored as plain strings; paths from other OSes are skipped gracefully at load time.
@@ -352,6 +369,17 @@ class SAM3Project:
                 return self.frames_dir
         video_hash = hashlib.md5(self.video_path.encode()).hexdigest()[:8]
         return os.path.join(tempfile.gettempdir(), f"sam3_frames_{video_hash}")
+
+    def get_video_path(self) -> str:
+        """Return the first reachable source video: video_path, then alt_video_paths.
+
+        Falls back to video_path when none exist so callers report the primary path in
+        their error. Read-only: never modifies project.json.
+        """
+        for p in [self.video_path, *(self.alt_video_paths or [])]:
+            if p and os.path.isfile(p):
+                return p
+        return self.video_path
 
     def get_concept_dir(self, concept_name: str) -> str:
         """Get directory for concept data"""
@@ -400,6 +428,9 @@ class SAM3Project:
             "alt_video_paths": self.alt_video_paths,
             "alt_frames_dirs": self.alt_frames_dirs,
             "is_image": self.is_image,
+            "vocabulary_path": self.vocabulary_path,
+            "gaze_csv_path": self.gaze_csv_path,
+            "gaze_world_path": self.gaze_world_path,
             "last_saved": self.last_saved,
             "concepts": [
                 {
@@ -473,6 +504,9 @@ class SAM3Project:
             alt_video_paths=project_data.get("alt_video_paths", []),
             alt_frames_dirs=project_data.get("alt_frames_dirs", []),
             is_image=project_data.get("is_image", False),
+            vocabulary_path=project_data.get("vocabulary_path"),
+            gaze_csv_path=project_data.get("gaze_csv_path"),
+            gaze_world_path=project_data.get("gaze_world_path"),
             last_saved=project_data.get("last_saved"),
             concept_order=project_data.get("concept_order", []),
             device=project_data.get("global_settings", {}).get("device", "cuda:0"),

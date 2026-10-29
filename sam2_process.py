@@ -110,13 +110,96 @@ def _read_mask(mask_path, cv2_mod):
 
 
 def _write_mask(dst_path, mask, cv2_mod):
-    """Write a uint8 mask array to dst_path (PNG or NPZ determined by suffix)."""
+    """Write a uint8 mask array to dst_path (PNG or NPZ determined by suffix).
+
+    Writes to a temporary file and renames it over dst_path. dst_path may be a hard link
+    into a SAM3 project left by an earlier run (_link_sam3_masks_to_output); writing in
+    place would overwrite the SAM3 original through the shared inode, while the rename
+    only replaces this directory entry.
+    """
     dst_path = Path(dst_path)
-    if dst_path.suffix == ".npz":
-        import numpy as _np
-        _np.savez_compressed(str(dst_path), mask=mask)
-    else:
-        cv2_mod.imwrite(str(dst_path), mask)
+    tmp_path = dst_path.with_name(f".{dst_path.stem}.tmp{os.getpid()}{dst_path.suffix}")
+    try:
+        if dst_path.suffix == ".npz":
+            import numpy as _np
+            _np.savez_compressed(str(tmp_path), mask=mask)
+            ok = True
+        else:
+            ok = cv2_mod.imwrite(str(tmp_path), mask)
+        if ok:
+            os.replace(str(tmp_path), str(dst_path))
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def _make_merged_mask_loader(masks_dir, masks_by_frame):
+    """Return a load_mask_func(frame_idx, obj_id) that reads from ``masks_dir`` using
+    the filename recorded in ``masks_by_frame[frame_idx][obj_id]``.
+
+    Handles both per-frame stacked NPZ (``npz_key``) and per-object NPZ / covered-union
+    NPZ (which store the array under the plain ``mask`` key), plus PNG. Used to
+    recompute quality metrics over the full merged mask set (SAM2 + SAM3 links +
+    covered unions) after all merging has happened.
+    """
+    masks_dir = Path(masks_dir)
+
+    def _loader(frame_idx, obj_id):
+        obj_data = masks_by_frame.get(frame_idx, {}).get(obj_id)
+        if obj_data is None:
+            return None
+        mask_path = masks_dir / obj_data["filename"]
+        if obj_data["filename"].endswith(".npz"):
+            try:
+                d = np.load(str(mask_path))
+                k = obj_data.get("npz_key", "")
+                if k not in d.files and "mask" in d.files:
+                    # Per-object NPZ (SAM3 link / covered-union) uses key 'mask'
+                    k = "mask"
+                return (d[k] > 0).astype(np.uint8) * 255 if k in d.files else None
+            except Exception:
+                return None
+        m = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        return (m > 0).astype(np.uint8) * 255 if m is not None else None
+
+    return _loader
+
+
+_PER_OBJECT_MASK_RE = re.compile(r"^mask_f\d{6}_.+_id(\d+)\.(png|npz)$")
+
+
+def _read_retired_sam3_ids(sam3_project) -> set:
+    """SAM2 ids of deleted SAM3 instances, from <sam3_project>/sam2_handoff.json "retired_ids"."""
+    if sam3_project is None:
+        return set()
+    handoff_path = Path(sam3_project) / "sam2_handoff.json"
+    if not handoff_path.exists():
+        return set()
+    try:
+        with open(handoff_path) as f:
+            return {int(k) for k in json.load(f).get("retired_ids", {})}
+    except Exception as e:
+        print(f"WARNING: could not read retired_ids from {handoff_path}: {e}")
+        return set()
+
+
+def _remove_retired_mask_files(masks_dir, retired_ids) -> int:
+    """Delete per-object mask files (mask_f*_<name>_id<N>.png/.npz) of retired ids.
+
+    These are hard links (or copies) of SAM3 masks made by an earlier run, or covered/
+    multi-instance unions. Unlinking a hard link leaves the SAM3 original intact.
+    Per-frame NPZ bundles are never touched (SAM3 masks are not stored in them).
+    """
+    masks_dir = Path(masks_dir)
+    if not retired_ids or not masks_dir.is_dir():
+        return 0
+    removed = 0
+    for f in masks_dir.iterdir():
+        m = _PER_OBJECT_MASK_RE.match(f.name)
+        if m and int(m.group(1)) in retired_ids:
+            f.unlink()
+            removed += 1
+    return removed
 
 
 def _link_sam3_masks_to_output(sam3_project, sam3_mask_dirs_rel, obj_ids,
@@ -401,7 +484,7 @@ class ConsoleProgressCallback:
 
 
 class SAM2Processor:
-    def __init__(self, config_file=None, checkpoint_file=None, model_name="sam2.1-base+", offload_to_cpu=False, async_loading=False, smooth_masks=False, device=None, frame_format="jpg", exclusive_masks=False, mask_format="png", vos_optimized=False, no_bfloat16=False, max_cond_frames_in_attn=-1):
+    def __init__(self, config_file=None, checkpoint_file=None, model_name="sam2.1-base+", offload_to_cpu=True, async_loading=False, smooth_masks=False, device=None, frame_format="jpg", exclusive_masks=False, mask_format="png", vos_optimized=False, no_bfloat16=False, max_cond_frames_in_attn=-1):
         """
         Initialize SAM2 Processor
 
@@ -409,7 +492,7 @@ class SAM2Processor:
             config_file: Path to model config YAML (overrides model_name)
             checkpoint_file: Path to checkpoint file (overrides model_name)
             model_name: Preset model name (e.g., 'sam2-base+', 'sam2.1-large', 'sam3')
-            offload_to_cpu: Use SAM2's CPU offloading for memory optimization
+            offload_to_cpu: Use SAM2's CPU offloading (video frames and inference state) for memory optimization (default True)
             async_loading: Use async frame loading (experimental, may reduce memory)
             smooth_masks: Apply morphological smoothing to reduce pixelation in masks
             device: Device to use (e.g., 'cpu', 'cuda', 'cuda:0', 'cuda:1'). If None, auto-detect.
@@ -1511,8 +1594,8 @@ Examples:
   # Use SAM2.1 large model
   python sam2_process.py annotations.json video.mp4 --model sam2.1-large
 
-  # Use CPU offloading for memory optimization
-  python sam2_process.py annotations.json video.mp4 --offload-to-cpu
+  # Keep video frames and inference state on the GPU (CPU offloading is on by default)
+  python sam2_process.py annotations.json video.mp4 --no-offload-to-cpu
 
   # Use a specific GPU (e.g., cuda:1)
   python sam2_process.py annotations.json video.mp4 --device cuda:1
@@ -1551,8 +1634,8 @@ Examples:
                             "errors. Primarily useful on pre-Ampere GPUs if autocast causes "
                             "problems. On pre-Ampere GPUs without this flag you will be asked "
                             "interactively.")
-    parser.add_argument("--offload-to-cpu", action="store_true",
-                       help="Offload video frames and model state to CPU to reduce GPU memory usage (slightly increases CPU memory usage and at a cost of a slightly slower speed)")
+    parser.add_argument("--no-offload-to-cpu", dest="offload_to_cpu", action="store_false",
+                       help="Keep video frames and model state on the GPU instead of offloading them to CPU (offloading is the default; it lowers GPU memory at the cost of CPU memory and slightly slower speed)")
     parser.add_argument("--async-loading", action="store_true",
                        help="Use async frame loading (not much benefit. Just kept this feature as it is available)")
     parser.add_argument("--smooth-masks", action="store_true",
@@ -1573,6 +1656,9 @@ Examples:
                        help="Directory with previous segmentation results to reuse masks from (used with --only-updated). Defaults to the output directory.")
     parser.add_argument("--sam3-project", type=str, default=None,
                        help="Path to SAM3 project directory. Required when the annotation file references SAM3 objects and processing runs on a different machine from where annotations were created.")
+    parser.add_argument("--no-final-quality-recompute", action="store_true",
+                       dest="no_final_quality_recompute",
+                       help="Skip the end-of-run quality-metrics recompute over the full merged mask set (--only-updated / SAM3-linked / covered-union). quality_metrics.npz then covers only SAM2-propagated objects.")
     parser.add_argument("--video-only", action="store_true",
                        help="Skip segmentation entirely; create/recreate the output video from existing masks in the output directory.")
     parser.add_argument("--exclusive-masks", action="store_true", dest="exclusive_masks",
@@ -1814,6 +1900,21 @@ Examples:
         print(f"SAM2 covered IDs (declared done by SAM3, excluded from re-segmentation): "
               f"{sorted(covered_set)}")
 
+    # SAM3 instances deleted since this annotation file was saved: sam3_process.py
+    # --export-sam2 moved their ids to "retired_ids" in the handoff. The handoff is the
+    # source of truth, so drop them here even if this (older) annotation file still lists
+    # them, and remove their stale masks from the output below. An id that has its own
+    # click annotations is a SAM2-native object and is left alone.
+    annotated_ids = {a["object_id"] for a in full_annotations_data.get("annotations", [])}
+    retired_ids = _read_retired_sam3_ids(sam3_project) - annotated_ids
+    if retired_ids:
+        dropped = sorted(retired_ids & (sam3_obj_ids | {int(k) for k in sam3_mask_dirs_rel}))
+        sam3_obj_ids -= retired_ids
+        sam3_mask_dirs_rel = {k: v for k, v in sam3_mask_dirs_rel.items() if int(k) not in retired_ids}
+        unchanged_ids -= retired_ids
+        if dropped:
+            print(f"Skipping retired SAM3 ids {dropped} (instances deleted in the SAM3 project)")
+
     if sam3_obj_ids and sam3_project:
         # Remove SAM3 objects from unchanged_ids — they'll be linked from native paths
         unchanged_ids -= sam3_obj_ids
@@ -1834,14 +1935,27 @@ Examples:
     frame_dir_used = None
     is_persistent = False
 
+    # Quality metrics recompute: whenever masks that process_segmentation does NOT score
+    # during propagation end up in the final set - reused --only-updated masks, SAM3-linked
+    # instances, or SAM2 covered-union masks - recompute the metrics over the full merged
+    # set at the end. Plain SAM2 runs skip this and keep the cheaper incremental metrics.
+    # SAM3-linked / covered-union masks only get merged into masks_by_frame when a
+    # --sam3-project is available to read the native masks from.
+    _sam3_will_merge = bool(
+        (sam3_obj_ids or sam2_covered_ids) and sam3_project and sam3_mask_dirs_rel
+    )
+    _will_recompute_quality = bool(
+        unchanged_ids or _sam3_will_merge
+    ) and not args.no_final_quality_recompute
+
     try:
         # Process segmentation
-        # Skip the intermediate quality metrics save when --only-updated has unchanged objects:
-        # those objects' masks aren't included in this run, so the metrics would be misleading.
-        # The merged quality metrics are calculated below after reusing unchanged masks.
+        # Skip the intermediate quality metrics save when we will recompute over the full
+        # merged set below: the partial metrics from propagation would otherwise be written
+        # and then immediately overwritten (and are misleading in the meantime).
         result = processor.process_segmentation(
             args.video_file, annotations_data, output_dir, frame_dir=args.frame_dir,
-            skip_quality_save=bool(unchanged_ids),
+            skip_quality_save=_will_recompute_quality,
             unchanged_ids=unchanged_ids if unchanged_ids else None,
         )
         masks_by_frame, object_names, object_colors, num_frames, frame_dir_used, is_persistent = result
@@ -1915,36 +2029,16 @@ Examples:
                 for oid, name in prev_names.items():
                     object_names[str(oid)] = name
                 print(f"Reused masks for unchanged objects {sorted(unchanged_ids)} from {prev_masks_dir}")
-
-                # Re-calculate quality metrics with all objects (updated + unchanged).
-                # The metrics saved inside process_segmentation only cover updated objects.
-                print("Re-calculating quality metrics with all objects (updated + unchanged)...")
-                _merged_masks_dir = output_dir / "masks"
-                def _load_merged_mask(frame_idx, obj_id):
-                    obj_data = masks_by_frame.get(frame_idx, {}).get(obj_id)
-                    if obj_data is None:
-                        return None
-                    mask_path = _merged_masks_dir / obj_data['filename']
-                    if obj_data['filename'].endswith('.npz'):
-                        try:
-                            d = np.load(str(mask_path))
-                            k = obj_data.get('npz_key', '')
-                            if k not in d.files and 'mask' in d.files:
-                                # Per-object NPZ (SAM3 link / covered-union) uses key 'mask'
-                                k = 'mask'
-                            return (d[k] > 0).astype(np.uint8) * 255 if k in d.files else None
-                        except Exception:
-                            return None
-                    m = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-                    return (m > 0).astype(np.uint8) * 255 if m is not None else None
-                from utils import calculate_quality_metrics
-                _inter, _bg, _overlap = calculate_quality_metrics(
-                    masks_by_frame, _load_merged_mask, (height, width), num_frames
-                )
-                save_quality_metrics(str(output_dir), _inter, _bg, _overlap)
-                print("OK: Re-saved quality metrics with all objects")
+                # Quality metrics for the merged set are recomputed once below, after SAM3
+                # links and covered-union masks have also been added to masks_by_frame.
             else:
                 print(f"WARNING: No masks found in {prev_masks_dir} for unchanged objects {sorted(unchanged_ids)}")
+
+        if retired_ids:
+            n_removed = _remove_retired_mask_files(output_dir / "masks", retired_ids)
+            if n_removed:
+                print(f"Removed {n_removed} stale mask file(s) of retired SAM3 ids "
+                      f"{sorted(retired_ids)} from {output_dir / 'masks'}")
 
         # Link SAM3 native masks into output_dir/masks/ (zero storage via hard links)
         if sam3_obj_ids and sam3_project and sam3_mask_dirs_rel:
@@ -2003,6 +2097,25 @@ Examples:
                 else:
                     print(f"  WARNING: No sub-id masks found for covered '{covered_name}' "
                           f"(id {covered_id}). Sub-ids: {sub_ids}")
+
+        # Recompute quality metrics over the full merged mask set (SAM2-propagated +
+        # --only-updated reused + SAM3-linked instances + SAM2 covered-union masks).
+        # Gated by _will_recompute_quality so plain SAM2 runs keep the incremental metrics.
+        # Always recompute when the intermediate save was skipped, even if no merge happened
+        # (e.g. --only-updated found no previous masks): otherwise no metrics file is written.
+        if _will_recompute_quality:
+            print("Recalculating quality metrics over all objects "
+                  "(SAM2 + SAM3 + covered unions)...")
+            from utils import calculate_quality_metrics
+            _quality_loader = _make_merged_mask_loader(output_dir / "masks", masks_by_frame)
+            _inter, _bg, _overlap = calculate_quality_metrics(
+                masks_by_frame, _quality_loader, (height, width), num_frames
+            )
+            save_quality_metrics(str(output_dir), _inter, _bg, _overlap)
+            print("OK: Saved quality metrics for all objects")
+        elif _sam3_will_merge and args.no_final_quality_recompute:
+            print("NOTE: --no-final-quality-recompute set; quality_metrics.npz covers only "
+                  "SAM2-propagated objects, not SAM3/covered-union masks.")
 
         # Export results
         processor.export_masks(masks_by_frame, args.video_file, object_names, output_dir)

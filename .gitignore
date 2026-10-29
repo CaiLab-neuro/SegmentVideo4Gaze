@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 *.pyo
 sam_models/
+
+# Sample video is a release asset (see sample_data/child_1min/README.md)
+sample_data/*/*.mp4
+sample_data/*_project/
+sample_data/*_gaze/

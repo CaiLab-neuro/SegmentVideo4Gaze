@@ -1,0 +1,15 @@
+{
+  "body": ["parent_body", "child_body"],
+  "hand": ["parent_left_hand", "parent_right_hand", "child_left_hand", "child_right_hand"],
+  "head": ["parent_head"],
+  "glasses": ["parent_eye_tracker"],
+  "mouth": ["parent_mouth"],
+  "fluffy toy": ["giraffe", "elephant", "green_toy", "red_toy"],
+  "table": ["table_in_center", "desk_under_screen"],
+  "basket": ["basket"],
+  "carpet_under_table": ["carpet_under_table"],
+  "toy_bag": ["toy_bag"],
+  "instruction_card": ["instruction_card"],
+  "wall": ["wall"],
+  "curtain": ["curtain"]
+}

@@ -122,7 +122,7 @@ python sam2_process.py annotations.json video.mp4 \
 | `--video-only` | Re-render video from existing masks, skip segmentation | — |
 | `--only-updated` | Re-segment only objects marked as updated; reuse other masks | — |
 | `--prev-results` | Directory with previous masks to reuse (with `--only-updated`) | output dir |
-| `--offload-to-cpu` | Offload video frames to CPU to reduce GPU memory usage | — |
+| `--no-offload-to-cpu` | Keep video frames and inference state on the GPU instead of offloading them to CPU (offloading is the default) | offload on |
 | `--frame-dir` | Persistent directory for extracted frames (avoids re-extraction) | temp dir |
 | `--mask-format` | Mask storage format: `png` or `npz` (compressed, faster I/O) | `png` |
 | `--no-bfloat16` | Disable bfloat16 autocast (relevant on pre-Ampere GPUs) | — |
@@ -146,7 +146,7 @@ These outputs feed directly into the [gaze-target alignment step](gaze_alignment
 
 ## Working with SAM3 Results (Handoff)
 
-If you segmented some objects with the [SAM3 pipeline](sam3_guide.md) first, export them with `sam3_process.py --export-sam2` and load the resulting `sam2_handoff.json` in `sam2_ui.py`. The SAM3-covered objects appear in the object list as **covered**: they need no click points and are skipped during segmentation — their masks are taken from the SAM3 project (as the union of the referenced SAM3 instance masks) at export time. You only annotate the objects SAM3 could not detect.
+If you segmented some objects with the [SAM3 pipeline](sam3_guide.md) first, export them with `sam3_process.py --export-sam2` and load the resulting `sam2_handoff.json` in `sam2_ui.py`. The SAM3-covered objects appear in the object list as **covered**: they need no click points and are skipped during segmentation — their masks are taken from the SAM3 project (as the union of the referenced SAM3 instance masks) at export time. You only annotate the objects SAM3 could not detect. To change or delete a SAM3-derived object, do it in the SAM3 project and re-export (see [Changing SAM3 objects after the handoff](sam3_guide.md#exporting-to-the-sam2-pipeline)); ids of deleted SAM3 instances stay reserved and cannot be annotated here.
 
 ## Point-Based Prompts with SAM3 Models
 
@@ -155,7 +155,7 @@ When a SAM3 installation is detected, the SAM2 UI also offers SAM3 checkpoints f
 ## Troubleshooting
 
 - **Model not found**: run `install.py` to download the checkpoint
-- **GPU out of memory**: use a smaller model (tiny or small), add `--offload-to-cpu`, or reduce video resolution
+- **GPU out of memory**: use a smaller model (tiny or small), make sure `--no-offload-to-cpu` is not set, or reduce video resolution
 - **Path errors**: ensure you're running from the repository directory
 - **Slow UI on long videos**: use `sam2_process.py` for segmentation instead of the in-UI button
 - **dtype-mismatch errors with `--no-bfloat16`**: SAM2 stores some internal tensors in bfloat16 regardless; the default (autocast enabled) is the recommended path

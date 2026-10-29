@@ -1147,6 +1147,40 @@ def export_mask_to_disk(
 # Quality Metrics Functions
 # =============================================================================
 
+def _mask_to_bool(mask: np.ndarray, height: int, width: int) -> np.ndarray:
+    """Binarize a mask (any non-zero value) and resize it to (height, width) if needed."""
+    if mask.shape != (height, width):
+        from PIL import Image as PILImage
+        mask_pil = PILImage.fromarray(mask.astype(np.uint8))
+        mask_pil = mask_pil.resize((width, height), PILImage.NEAREST)
+        mask = np.array(mask_pil)
+    return mask > 0
+
+
+def _union_xor_change_count(prev_masks: Dict[int, np.ndarray],
+                            cur_masks: Dict[int, np.ndarray],
+                            height: int, width: int) -> int:
+    """
+    Count pixels where at least one object's mask changed between two frames.
+
+    Computes |OR_k (M_k(prev) XOR M_k(cur))| over the union of object IDs present
+    in either frame; an object missing from one frame counts as an empty mask there.
+    Unlike diffing a single obj_id label map, this is not affected by overlapping
+    masks (no last-writer-wins) or by obj_id overflowing the label dtype. Masks
+    must already be boolean at (height, width).
+    """
+    changed = np.zeros((height, width), dtype=bool)
+    for obj_id in prev_masks.keys() | cur_masks.keys():
+        prev = prev_masks.get(obj_id)
+        cur = cur_masks.get(obj_id)
+        if prev is None:
+            changed |= cur
+        elif cur is None:
+            changed |= prev
+        else:
+            changed |= prev ^ cur
+    return int(np.count_nonzero(changed))
+
 class IncrementalQualityMetricsCalculator:
     """
     Calculate quality metrics incrementally during video propagation.
@@ -1187,55 +1221,45 @@ class IncrementalQualityMetricsCalculator:
         self.background_ratios: List[float] = [0.0] * num_frames
         self.overlap_ratios: List[float] = [0.0] * num_frames
 
-        # State for forward pass
-        self._forward_prev_mask: Optional[np.ndarray] = None
+        # State for forward pass: previous frame's per-object boolean masks
+        self._forward_prev_masks: Optional[Dict[int, np.ndarray]] = None
 
-        # State for backward pass
-        self._backward_next_mask: Optional[np.ndarray] = None
+        # State for backward pass: next frame's (in forward order) per-object masks
+        self._backward_next_masks: Optional[Dict[int, np.ndarray]] = None
 
         # Track which pass has been run
         self._forward_completed = False
         self._backward_completed = False
 
-    def _create_combined_mask(self, object_masks: Dict[int, np.ndarray]) -> np.ndarray:
+    def _normalize_masks(self, object_masks: Dict[int, np.ndarray]) -> Dict[int, np.ndarray]:
         """
-        Create a combined mask from individual object masks.
+        Convert object masks to boolean arrays at frame resolution.
 
         Args:
             object_masks: Dictionary mapping obj_id -> mask array (H, W)
 
         Returns:
-            Combined mask where each pixel contains the obj_id (0 for background)
+            Dictionary mapping obj_id -> bool array (H, W); None masks are dropped
         """
-        combined = np.zeros((self.height, self.width), dtype=np.uint8)
+        return {
+            obj_id: _mask_to_bool(mask, self.height, self.width)
+            for obj_id, mask in object_masks.items()
+            if mask is not None
+        }
 
-        for obj_id, mask in object_masks.items():
-            if mask is None:
-                continue
+    def _calculate_background_ratio(self, bool_masks: Dict[int, np.ndarray]) -> float:
+        """Calculate the ratio of pixels not covered by any object."""
+        union = np.zeros((self.height, self.width), dtype=bool)
+        for mask in bool_masks.values():
+            union |= mask
+        return 1.0 - (np.count_nonzero(union) / self.total_pixels)
 
-            # Ensure mask matches frame dimensions
-            if mask.shape != (self.height, self.width):
-                from PIL import Image as PILImage
-                mask_pil = PILImage.fromarray(mask.astype(np.uint8))
-                mask_pil = mask_pil.resize((self.width, self.height), PILImage.NEAREST)
-                mask = np.array(mask_pil)
+    def _calculate_change_ratio(self, masks1: Dict[int, np.ndarray],
+                                masks2: Dict[int, np.ndarray]) -> float:
+        """Ratio of pixels where any object's mask changed (union of per-object XORs)."""
+        return _union_xor_change_count(masks1, masks2, self.height, self.width) / self.total_pixels
 
-            # Mark object pixels
-            combined[mask > 0] = obj_id
-
-        return combined
-
-    def _calculate_background_ratio(self, combined_mask: np.ndarray) -> float:
-        """Calculate the ratio of background pixels."""
-        object_pixels = np.count_nonzero(combined_mask)
-        return 1.0 - (object_pixels / self.total_pixels)
-
-    def _calculate_change_ratio(self, mask1: np.ndarray, mask2: np.ndarray) -> float:
-        """Calculate the ratio of pixels that changed between two masks."""
-        changed_pixels = np.count_nonzero(mask1 != mask2)
-        return changed_pixels / self.total_pixels
-
-    def _calculate_overlap_ratio(self, object_masks: Dict[int, np.ndarray]) -> float:
+    def _calculate_overlap_ratio(self, bool_masks: Dict[int, np.ndarray]) -> float:
         """
         Calculate the ratio of overlapping category assignments.
 
@@ -1246,37 +1270,22 @@ class IncrementalQualityMetricsCalculator:
         - Pixel in 3 objects: contributes 2
 
         Args:
-            object_masks: Dictionary mapping obj_id -> mask array (H, W)
+            bool_masks: Dictionary mapping obj_id -> bool array (H, W)
 
         Returns:
             Ratio of excess category assignments (0.0 = no overlap, higher = more overlap)
         """
         # Create a count map: how many objects claim each pixel
         overlap_count = np.zeros((self.height, self.width), dtype=np.int32)
-
-        for obj_id, mask in object_masks.items():
-            if mask is None:
-                continue
-
-            # Ensure mask matches frame dimensions
-            if mask.shape != (self.height, self.width):
-                from PIL import Image as PILImage
-                mask_pil = PILImage.fromarray(mask.astype(np.uint8))
-                mask_pil = mask_pil.resize((self.width, self.height), PILImage.NEAREST)
-                mask = np.array(mask_pil)
-
-            # Increment count for each pixel claimed by this object
-            overlap_count[mask > 0] += 1
+        for mask in bool_masks.values():
+            overlap_count += mask
 
         # For pixels with count > 0, subtract 1 to get the excess overlap count
         # (pixels in only 1 category don't count as overlap)
         excess_overlaps = np.where(overlap_count > 0, overlap_count - 1, 0)
 
-        # Total excess assignments across all pixels
-        total_excess = np.sum(excess_overlaps)
-
-        # Return as ratio of total pixels
-        return total_excess / self.total_pixels
+        # Total excess assignments across all pixels, as ratio of total pixels
+        return np.sum(excess_overlaps) / self.total_pixels
 
     def update_forward(self, frame_idx: int, object_masks: Dict[int, np.ndarray]) -> None:
         """
@@ -1291,25 +1300,25 @@ class IncrementalQualityMetricsCalculator:
         if frame_idx < 0 or frame_idx >= self.num_frames:
             return
 
-        combined_mask = self._create_combined_mask(object_masks)
+        bool_masks = self._normalize_masks(object_masks)
 
         # Calculate background ratio
-        self.background_ratios[frame_idx] = self._calculate_background_ratio(combined_mask)
+        self.background_ratios[frame_idx] = self._calculate_background_ratio(bool_masks)
 
         # Calculate overlap ratio
-        self.overlap_ratios[frame_idx] = self._calculate_overlap_ratio(object_masks)
+        self.overlap_ratios[frame_idx] = self._calculate_overlap_ratio(bool_masks)
 
         # Calculate inter-frame change
-        if self._forward_prev_mask is None:
+        if self._forward_prev_masks is None:
             # First frame: no previous to compare
             self.inter_frame_changes[frame_idx] = 0.0
         else:
             self.inter_frame_changes[frame_idx] = self._calculate_change_ratio(
-                self._forward_prev_mask, combined_mask
+                self._forward_prev_masks, bool_masks
             )
 
-        # Store current mask for next iteration
-        self._forward_prev_mask = combined_mask.copy()
+        # Store current masks for next iteration (fresh arrays, no aliasing with caller)
+        self._forward_prev_masks = bool_masks
 
     def update_backward(self, frame_idx: int, object_masks: Dict[int, np.ndarray]) -> None:
         """
@@ -1325,26 +1334,26 @@ class IncrementalQualityMetricsCalculator:
         if frame_idx < 0 or frame_idx >= self.num_frames:
             return
 
-        combined_mask = self._create_combined_mask(object_masks)
+        bool_masks = self._normalize_masks(object_masks)
 
         # Update background ratio with final mask
-        self.background_ratios[frame_idx] = self._calculate_background_ratio(combined_mask)
+        self.background_ratios[frame_idx] = self._calculate_background_ratio(bool_masks)
 
         # Update overlap ratio with final mask
-        self.overlap_ratios[frame_idx] = self._calculate_overlap_ratio(object_masks)
+        self.overlap_ratios[frame_idx] = self._calculate_overlap_ratio(bool_masks)
 
         # Update inter-frame change for the NEXT frame (in forward order)
         # When processing frame i in backward order, we have:
-        # - combined_mask: mask for frame i
-        # - _backward_next_mask: mask for frame i+1 (from previous backward iteration)
+        # - bool_masks: masks for frame i
+        # - _backward_next_masks: masks for frame i+1 (from previous backward iteration)
         # inter_frame_changes[i+1] = change from frame i to frame i+1
-        if self._backward_next_mask is not None and frame_idx + 1 < self.num_frames:
+        if self._backward_next_masks is not None and frame_idx + 1 < self.num_frames:
             self.inter_frame_changes[frame_idx + 1] = self._calculate_change_ratio(
-                combined_mask, self._backward_next_mask
+                bool_masks, self._backward_next_masks
             )
 
-        # Store current mask for next backward iteration
-        self._backward_next_mask = combined_mask.copy()
+        # Store current masks for next backward iteration
+        self._backward_next_masks = bool_masks
 
         # Mark backward pass for frame 0 as completed
         if frame_idx == 0:
@@ -1431,34 +1440,26 @@ class QualityMetricsCalculator:
         self.background_ratios = []
         self.overlap_ratios = []
 
-        prev_combined_mask = None
+        prev_masks: Optional[Dict[int, np.ndarray]] = None
 
         for frame_idx in range(self.num_frames):
-            # Create combined mask for this frame (all objects)
-            combined_mask = np.zeros((self.height, self.width), dtype=np.uint8)
-
-            # Track overlap count for this frame
-            overlap_count = np.zeros((self.height, self.width), dtype=np.int32)
-
+            # Load this frame's per-object boolean masks
+            cur_masks: Dict[int, np.ndarray] = {}
             if frame_idx in masks:
                 for obj_id in masks[frame_idx]:
                     mask = load_mask_func(frame_idx, obj_id)
                     if mask is not None:
-                        # Resize if needed
-                        if mask.shape != (self.height, self.width):
-                            from PIL import Image as PILImage
-                            mask_pil = PILImage.fromarray(mask)
-                            mask_pil = mask_pil.resize((self.width, self.height), PILImage.NEAREST)
-                            mask = np.array(mask_pil)
+                        cur_masks[obj_id] = _mask_to_bool(mask, self.height, self.width)
 
-                        # Mark object pixels (any non-zero value)
-                        combined_mask[mask > 0] = obj_id
-
-                        # Count overlaps
-                        overlap_count[mask > 0] += 1
+            # Union of all objects and per-pixel overlap count
+            union = np.zeros((self.height, self.width), dtype=bool)
+            overlap_count = np.zeros((self.height, self.width), dtype=np.int32)
+            for mask in cur_masks.values():
+                union |= mask
+                overlap_count += mask
 
             # Calculate background ratio
-            object_pixels = np.count_nonzero(combined_mask)
+            object_pixels = np.count_nonzero(union)
             bg_ratio = 1.0 - (object_pixels / self.total_pixels)
             self.background_ratios.append(bg_ratio)
 
@@ -1468,16 +1469,16 @@ class QualityMetricsCalculator:
             self.overlap_ratios.append(overlap_ratio)
 
             # Calculate inter-frame change
-            if prev_combined_mask is None:
+            if prev_masks is None:
                 # First frame: no previous frame to compare
                 self.inter_frame_changes.append(0.0)
             else:
-                # Count pixels that changed category
-                changed_pixels = np.count_nonzero(combined_mask != prev_combined_mask)
+                # Count pixels where any object's mask changed (union of per-object XORs)
+                changed_pixels = _union_xor_change_count(prev_masks, cur_masks, self.height, self.width)
                 change_ratio = changed_pixels / self.total_pixels
                 self.inter_frame_changes.append(change_ratio)
 
-            prev_combined_mask = combined_mask.copy()
+            prev_masks = cur_masks
 
         print(f"Calculated metrics for {self.num_frames} frames")
         if len(self.inter_frame_changes) > 1:
@@ -1486,6 +1487,180 @@ class QualityMetricsCalculator:
         print(f"  Mean overlap ratio: {np.mean(self.overlap_ratios):.3f}")
 
         return self.inter_frame_changes, self.background_ratios, self.overlap_ratios
+
+    def calculate_grouped(
+        self,
+        masks: Dict[int, Dict[int, Any]],
+        load_mask_func: Callable[[int, int], Optional[np.ndarray]],
+        obj_id_to_group: Dict[int, Any],
+    ) -> Dict[str, Any]:
+        """
+        Calculate quality metrics with per-group (per-concept) inter-frame change
+        and overlap ratios, plus a single global background ratio.
+
+        Rationale:
+          - Background ratio measures how much of the frame is segmented at all;
+            a single global number is the meaningful summary.
+          - Inter-frame change is only meaningful *within* a category; a jittery
+            concept should not be averaged away by a stable one.  The per-concept
+            track is normalized by that concept's peak single-frame area (max over
+            all frames of |union of its instances|) rather than by the total frame
+            pixel count, so concepts are comparable regardless of how much of the
+            frame they cover.  The global 'inter_frame_changes' track keeps the
+            old frame-pixel normalization for backward compatibility.
+          - Overlap is measured per concept as a one-vs-rest cross-concept ratio:
+            the fraction of that concept's segmented area that is also claimed by
+            at least one *other* concept.  Within-concept overlap is not measured
+            because SAM3 already enforces pixel-wise mutual exclusivity among the
+            instances of a single concept (Sam3VideoInference._postprocess_output
+            calls _apply_object_wise_non_overlapping_constraints unconditionally),
+            so it is ~0 by construction.  A global excess-assignment overlap track
+            is still returned under 'overlap_ratios' for backward compatibility.
+
+        Args:
+            masks: {frame_idx: {obj_id: mask_data}}
+            load_mask_func: (frame_idx, obj_id) -> np.ndarray | None
+            obj_id_to_group: {obj_id: group_key} (typically concept name)
+
+        Returns a dict:
+            'background_ratios':            [float] * num_frames  (global)
+            'inter_frame_changes':          [float] * num_frames  (global aggregate,
+                                             identical semantics to calculate(); kept
+                                             for backward compatibility)
+            'overlap_ratios':               [float] * num_frames  (global excess-
+                                             assignment aggregate, backward compat)
+            'group_names':                  [group_key, ...]  (stable order)
+            'inter_frame_changes_by_group': {group_key: [float] * num_frames}
+                                             pixels where any of the concept's
+                                             instance masks changed between
+                                             consecutive frames (union of per-
+                                             instance XORs) / max single-frame
+                                             union area of that concept
+            'overlap_ratios_by_group':      {group_key: [float] * num_frames}
+                                             one-vs-rest cross-concept ratio:
+                                             |concept_area ∩ (claimed by another
+                                             concept)| / |concept_area|; 0.0 when
+                                             the concept is absent on that frame
+        """
+        print("Calculating segmentation quality metrics (per-concept)...")
+
+        group_names = list(dict.fromkeys(
+            obj_id_to_group[k] for k in sorted(obj_id_to_group)
+        ))
+        group_of = obj_id_to_group
+
+        bg_ratios: List[float] = []
+        inter_global: List[float] = []
+        overlap_global: List[float] = []
+        # Per-concept inter-frame change is stored as a raw changed-pixel count here
+        # and normalized after the loop by that concept's *peak* single-frame area
+        # (max over all frames of |union of the concept's instances|).  Dividing by a
+        # per-concept constant makes concepts comparable regardless of size, without
+        # the small-frame blow-up a per-frame-union denominator would cause.
+        inter_raw_by_group: Dict[Any, List[float]] = {g: [] for g in group_names}
+        max_union_area: Dict[Any, int] = {g: 0 for g in group_names}
+        overlap_by_group: Dict[Any, List[float]] = {g: [] for g in group_names}
+
+        prev_masks: Optional[Dict[int, np.ndarray]] = None
+
+        for frame_idx in range(self.num_frames):
+            # Load this frame's per-object boolean masks
+            cur_masks: Dict[int, np.ndarray] = {}
+            if frame_idx in masks:
+                for obj_id in masks[frame_idx]:
+                    mask = load_mask_func(frame_idx, obj_id)
+                    if mask is not None:
+                        cur_masks[obj_id] = _mask_to_bool(mask, self.height, self.width)
+
+            global_union = np.zeros((self.height, self.width), dtype=bool)
+            global_overlap_count = np.zeros((self.height, self.width), dtype=np.int32)
+            group_union = {
+                g: np.zeros((self.height, self.width), dtype=bool) for g in group_names
+            }
+            for obj_id, hit in cur_masks.items():
+                global_union |= hit
+                global_overlap_count += hit
+                g = group_of.get(obj_id)
+                if g in group_union:
+                    group_union[g] |= hit
+
+            # Number of *distinct concepts* covering each pixel (for one-vs-rest overlap)
+            concept_coverage_count = np.zeros((self.height, self.width), dtype=np.int32)
+            for g in group_names:
+                concept_coverage_count += group_union[g]
+
+            # Global background ratio
+            object_pixels = np.count_nonzero(global_union)
+            bg_ratios.append(1.0 - (object_pixels / self.total_pixels))
+
+            # Global aggregates (backward compatible with calculate())
+            excess = np.where(global_overlap_count > 0, global_overlap_count - 1, 0)
+            overlap_global.append(float(np.sum(excess) / self.total_pixels))
+            # Inter-frame change: union of per-object XORs, globally and per concept.
+            # Each object's XOR is computed once and OR'd into both change maps; an
+            # object missing from one frame counts as an empty mask there.
+            if prev_masks is None:
+                inter_global.append(0.0)
+            else:
+                global_changed = np.zeros((self.height, self.width), dtype=bool)
+                group_changed = {
+                    g: np.zeros((self.height, self.width), dtype=bool) for g in group_names
+                }
+                for obj_id in prev_masks.keys() | cur_masks.keys():
+                    prev = prev_masks.get(obj_id)
+                    cur = cur_masks.get(obj_id)
+                    if prev is None:
+                        diff = cur
+                    elif cur is None:
+                        diff = prev
+                    else:
+                        diff = prev ^ cur
+                    global_changed |= diff
+                    g = group_of.get(obj_id)
+                    if g in group_changed:
+                        group_changed[g] |= diff
+                inter_global.append(np.count_nonzero(global_changed) / self.total_pixels)
+
+            # Per-group metrics
+            for g in group_names:
+                union = group_union[g]
+                area = int(np.count_nonzero(union))
+                if area > max_union_area[g]:
+                    max_union_area[g] = area
+                if area == 0:
+                    overlap_by_group[g].append(0.0)
+                else:
+                    contested = int(np.count_nonzero(union & (concept_coverage_count >= 2)))
+                    overlap_by_group[g].append(contested / area)
+                if prev_masks is None:
+                    inter_raw_by_group[g].append(0.0)
+                else:
+                    inter_raw_by_group[g].append(float(np.count_nonzero(group_changed[g])))
+
+            prev_masks = cur_masks
+
+        # Normalize per-concept inter-frame change by the concept's peak area
+        inter_by_group: Dict[Any, List[float]] = {}
+        for g in group_names:
+            denom = max_union_area[g]
+            if denom > 0:
+                inter_by_group[g] = [c / denom for c in inter_raw_by_group[g]]
+            else:
+                inter_by_group[g] = [0.0 for _ in inter_raw_by_group[g]]
+
+        print(f"Calculated per-concept metrics for {self.num_frames} frames, "
+              f"{len(group_names)} concept(s)")
+        if len(bg_ratios) > 1:
+            print(f"  Mean background ratio: {np.mean(bg_ratios):.3f}")
+
+        return {
+            'background_ratios': bg_ratios,
+            'inter_frame_changes': inter_global,
+            'overlap_ratios': overlap_global,
+            'group_names': group_names,
+            'inter_frame_changes_by_group': inter_by_group,
+            'overlap_ratios_by_group': overlap_by_group,
+        }
 
 
 def calculate_quality_metrics(
@@ -1508,6 +1683,23 @@ def calculate_quality_metrics(
     """
     calculator = QualityMetricsCalculator(frame_dimensions, num_frames)
     return calculator.calculate(masks, load_mask_func)
+
+
+def calculate_quality_metrics_grouped(
+    masks: Dict[int, Dict[int, Any]],
+    load_mask_func: Callable[[int, int], Optional[np.ndarray]],
+    obj_id_to_group: Dict[int, Any],
+    frame_dimensions: Tuple[int, int],
+    num_frames: int
+) -> Dict[str, Any]:
+    """
+    Convenience wrapper around QualityMetricsCalculator.calculate_grouped().
+
+    Returns the dict documented on calculate_grouped(): a global background ratio
+    and global aggregates plus per-group inter-frame-change / overlap ratios.
+    """
+    calculator = QualityMetricsCalculator(frame_dimensions, num_frames)
+    return calculator.calculate_grouped(masks, load_mask_func, obj_id_to_group)
 
 
 def save_quality_metrics(
@@ -1548,6 +1740,55 @@ def save_quality_metrics(
         np.savez_compressed(metrics_path, **save_dict)
 
         print(f"Saved quality metrics to {metrics_path}")
+        return True
+    except Exception as e:
+        print(f"WARNING: Failed to save quality metrics: {e}")
+        return False
+
+
+def save_quality_metrics_grouped(output_dir: str, result: Dict[str, Any]) -> bool:
+    """
+    Save the dict produced by calculate_quality_metrics_grouped() to
+    quality_metrics.npz.
+
+    The file stays backward compatible: the global keys ('inter_frame_changes',
+    'background_ratios', 'overlap_ratios', 'frame_count') are written exactly as
+    save_quality_metrics() writes them, so older readers keep working.  Per-concept
+    data is added under extra keys that older readers simply ignore:
+        'group_names'                  1-D unicode array
+        'inter_frame_changes_by_group' 2-D array, shape (n_groups, n_frames)
+        'overlap_ratios_by_group'      2-D array, shape (n_groups, n_frames)
+    """
+    inter = list(result.get('inter_frame_changes') or [])
+    bg = list(result.get('background_ratios') or [])
+    if not inter or not bg:
+        print("No quality metrics to save")
+        return False
+
+    try:
+        metrics_path = os.path.join(output_dir, "quality_metrics.npz")
+        save_dict = {
+            'inter_frame_changes': np.array(inter),
+            'background_ratios': np.array(bg),
+            'frame_count': len(inter),
+        }
+        overlap = result.get('overlap_ratios')
+        if overlap is not None:
+            save_dict['overlap_ratios'] = np.array(overlap)
+
+        group_names = list(result.get('group_names') or [])
+        if group_names:
+            inter_bg = result.get('inter_frame_changes_by_group', {}) or {}
+            overlap_bg = result.get('overlap_ratios_by_group', {}) or {}
+            save_dict['group_names'] = np.array([str(g) for g in group_names])
+            save_dict['inter_frame_changes_by_group'] = np.array(
+                [inter_bg[g] for g in group_names], dtype=float)
+            save_dict['overlap_ratios_by_group'] = np.array(
+                [overlap_bg[g] for g in group_names], dtype=float)
+
+        np.savez_compressed(metrics_path, **save_dict)
+        print(f"Saved quality metrics to {metrics_path}"
+              + (f" ({len(group_names)} concept(s))" if group_names else ""))
         return True
     except Exception as e:
         print(f"WARNING: Failed to save quality metrics: {e}")
@@ -1704,6 +1945,56 @@ def load_quality_metrics(output_dir: str) -> Tuple[Optional[List[float]], Option
     except Exception as e:
         print(f"WARNING: Failed to load quality metrics: {e}")
         return None, None, None
+
+
+def load_quality_metrics_grouped(output_dir: str) -> Optional[Dict[str, Any]]:
+    """
+    Load quality_metrics.npz including per-concept metrics when present.
+
+    Returns a dict with the same shape as calculate_quality_metrics_grouped()'s
+    output, or None if the file is missing/unreadable.  Files written by the
+    older (non-grouped) version load fine: 'group_names' and the *_by_group
+    entries come back as None.
+    """
+    metrics_path = os.path.join(output_dir, "quality_metrics.npz")
+    if not os.path.exists(metrics_path):
+        print("No quality metrics file found (OK for older results)")
+        return None
+
+    try:
+        data = np.load(metrics_path)
+        out: Dict[str, Any] = {
+            'inter_frame_changes': data['inter_frame_changes'].tolist(),
+            'background_ratios': data['background_ratios'].tolist(),
+            'overlap_ratios': (data['overlap_ratios'].tolist()
+                               if 'overlap_ratios' in data else None),
+            'group_names': None,
+            'inter_frame_changes_by_group': None,
+            'overlap_ratios_by_group': None,
+        }
+
+        if 'group_names' in data:
+            names = [str(x) for x in data['group_names'].tolist()]
+            out['group_names'] = names
+            if 'inter_frame_changes_by_group' in data:
+                arr = data['inter_frame_changes_by_group']
+                out['inter_frame_changes_by_group'] = {
+                    n: arr[i].tolist() for i, n in enumerate(names)
+                }
+            if 'overlap_ratios_by_group' in data:
+                arr = data['overlap_ratios_by_group']
+                out['overlap_ratios_by_group'] = {
+                    n: arr[i].tolist() for i, n in enumerate(names)
+                }
+            print(f"Loaded quality metrics: {len(names)} concept(s), "
+                  f"{len(out['inter_frame_changes'])} frames")
+        else:
+            print(f"Loaded quality metrics: "
+                  f"{len(out['inter_frame_changes'])} values (no per-concept data)")
+        return out
+    except Exception as e:
+        print(f"WARNING: Failed to load quality metrics: {e}")
+        return None
 
 
 # =============================================================================
