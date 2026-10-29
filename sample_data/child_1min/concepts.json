@@ -1,0 +1,17 @@
+{
+  "concepts": [
+    {"name": "body", "text_prompt": "people", "detection_frame": 0},
+    {"name": "hand", "text_prompt": "hand", "detection_frame": 0},
+    {"name": "head", "text_prompt": "head", "detection_frame": 0},
+    {"name": "glasses", "text_prompt": "glasses", "detection_frame": 0},
+    {"name": "mouth", "text_prompt": "mouth", "detection_frame": 0},
+    {"name": "fluffy toy", "text_prompt": "fluffy toy", "detection_frame": 0},
+    {"name": "table", "text_prompt": "table", "detection_frame": 0},
+    {"name": "basket", "text_prompt": "basket", "detection_frame": 0},
+    {"name": "carpet_under_table", "text_prompt": "carpet", "detection_frame": 0},
+    {"name": "toy_bag", "text_prompt": "black bag", "detection_frame": 0},
+    {"name": "instruction_card", "text_prompt": "paper", "detection_frame": 0},
+    {"name": "wall", "text_prompt": "wall", "detection_frame": 0},
+    {"name": "curtain", "text_prompt": "curtain", "detection_frame": 0}
+  ]
+}

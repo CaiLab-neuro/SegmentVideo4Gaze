@@ -35,4 +35,4 @@ python sam3_process.py --project example/your_project --refine
 python sam3_process.py --project example/your_project --export example/output.mp4
 ```
 
-An example dataset and a ready-to-run command will be added here later.
+A ready-to-run sample (1 minute of egocentric video with gaze data, concepts and vocabulary) is in [`sample_data/child_1min/`](../sample_data/child_1min/README.md).
