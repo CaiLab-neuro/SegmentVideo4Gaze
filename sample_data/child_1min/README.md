@@ -10,11 +10,16 @@ gaze data. Use it to try the SAM3 pipeline and the gaze-to-object alignment end 
 |---|---|
 | `child_1min.mp4` | Scene video (no audio), **not stored in git**: download it from the release (see below). Frame *i* = row *i* of `world_timestamps.csv`. |
 | `world_timestamps.csv`, `gaze.csv`, `fixations.csv`, `blinks.csv`, `scene_camera.json` | Pupil Labs Neon "Timeseries Data" format. Timestamps are re-based (not Unix time); ids are placeholders (de-identified). |
-| `concepts.json` | 13 text-prompt concepts for `sam3_process.py --concepts`. |
-| `concepts_vocabulary.json` | Suggested instance names per concept, for `sam3_ui.py` (Vocabulary -> Load Vocabulary File). |
+| `concepts.json` | 13 text-prompt concepts for `sam3_process.py --concepts`. Each entry has a `name` (label used on disk and in the UI) and a `text_prompt` (what SAM3 searches for). `detection_frame` is optional (default 0) and only affects the UI preview, not what gets detected. |
+| `concepts_vocabulary.json` | Optional. Maps each concept name to suggested **instance** names, shown as a dropdown when you rename detected instances in `sam3_ui.py` (Vocabulary -> Load Vocabulary File). You can always type a custom name. |
 
 `hand` is one concept (not separate left/right concepts), so SAM3 keeps the hand masks
 mutually exclusive. Name the detected instances afterwards (e.g. `parent_left_hand`).
+
+A concept can produce several instances (`hand` finds up to four here); the vocabulary is
+where you list the names you expect. Concepts that only ever have one instance (`wall`,
+`basket`) can just repeat the name. For your own video, copy `concepts.json` and
+`concepts_vocabulary.json` and adapt the prompts and names to your scene.
 
 ## Download the video
 
@@ -46,7 +51,11 @@ python sam3_ui.py sample_data/child_1min_project
 # 3. Replay refinement clicks made in the UI
 python sam3_process.py --project sample_data/child_1min_project --refine
 
-# 4. Which object is gazed at in each frame
+# 4. Export an overlay video
+python sam3_process.py --project sample_data/child_1min_project \
+    --export sample_data/child_1min_project/overlay.mp4
+
+# 5. Which object is gazed at in each frame
 python process_gaze_mask_alignment.py \
     --subject-id 1 --camera-id child \
     --gaze-csv  sample_data/child_1min/gaze.csv \
