@@ -23,7 +23,7 @@ For gaze coordinate data, we follow the format of Pupil Labs output.
 
 - **`{subject_id}_{camera}_gaze.csv`**: one row per gaze sample, ordered by time. Required columns are `timestamp [ns]`, `gaze x [px]`, and `gaze y [px]`. Additional columns are allowed and are preserved in the merged/output tables.
 - **`{subject_id}_{camera}_world_timestamps.csv`**: one row per world-camera frame, ordered by time. Required column is `timestamp [ns]`. Additional columns are allowed, but the script rebuilds `frame_idx` and `frame_timestamp` from this file during alignment.
-- **`{subject_id}_{camera}_blinks.csv`**: used only with `--blink-dir`. The code expects `start timestamp [ns]`, `end timestamp [ns]`, and `blink id`, because those columns are used to mark whether a gaze sample falls inside a blink interval.
+- **`{subject_id}_{camera}_blinks.csv`**: used only with `--blink-dir` (or pass any file name with `--blink-csv`). The code expects `start timestamp [ns]`, `end timestamp [ns]`, and `blink id`, because those columns are used to mark whether a gaze sample falls inside a blink interval.
 
 **Minimum column examples**:
 ```csv
@@ -109,6 +109,7 @@ python process_gaze_mask_alignment.py \
 | `--camera-id` | Camera ID(s), e.g. `child` or `child,parent`. Auto-discovered if omitted. |
 | `--gaze-csv` / `--world-csv` | Direct paths to a single gaze CSV / world-timestamps CSV, bypassing the naming convention (use together, with exactly one subject/camera pair) |
 | `--blink-dir` | Directory with `{subject}_{camera}_blinks.csv` files for blink labeling/removal |
+| `--blink-csv` | Direct path to a single blinks CSV with any file name, instead of `--blink-dir` (not combinable with it; needs exactly one subject/camera pair) |
 | `--ignore-object-list` | Text file with object labels to ignore, one per line (`#` comments allowed). SAM2: names, IDs, or mask filenames; SAM3: `concept_name`, `user_name`, or `concept_user_name` |
 | `--gaze-radius` | Radius (pixels) of the disk around each gaze point used for mask-overlap confidence (default 20). Larger = more tolerant of tracking noise, but blurs nearby objects |
 | `--gaze-confidence-threshold` | Minimum overlap confidence to assign a gazed object (default 0.5). The raw confidence is always recorded unthresholded |
@@ -131,8 +132,8 @@ python process_gaze_mask_alignment.py \
 - **`output_dir/{subject_id}/{camera}/{subject_id}_{camera}_gazed_object.csv`** — gaze samples with assigned object labels and confidence
 - **`output_dir/{subject_id}/{camera}/{subject_id}_{camera}_gaze_object_probabilities.pkl`** — per-gaze probabilities for all available masks (also serves as a cache for re-runs)
 - **`output_dir/{subject_id}/{camera}/{subject_id}_{camera}_gaze_object_probabilities.settings.json`** — settings the `.pkl` was computed with, used to decide whether the cache can be reused
-- **`output_dir/{subject_id}/{camera}/{subject_id}_{camera}_gaze_blink_labeled.csv`** — blink-labeled gaze data when `--blink-dir` is used
-- **`output_dir/{subject_id}/{camera}/{subject_id}_{camera}_gaze_blink_removed.csv`** — blink-removed gaze data when `--blink-dir` is used
+- **`output_dir/{subject_id}/{camera}/{subject_id}_{camera}_gaze_blink_labeled.csv`** — blink-labeled gaze data when `--blink-dir` or `--blink-csv` is used
+- **`output_dir/{subject_id}/{camera}/{subject_id}_{camera}_gaze_blink_removed.csv`** — blink-removed gaze data when `--blink-dir` or `--blink-csv` is used
 - **`output_dir/{subject_id}/{camera}/figures/`** — trajectory plots and confidence heatmaps (PNG and PDF)
   (rarely gazed-at categories are pooled into an `other` row; see `--min-gaze-fraction`. Grouping affects only the figures, not the CSV or pickle outputs)
 
@@ -143,7 +144,7 @@ The main output CSV keeps the original gaze columns and any extra gaze metadata,
 
 - `frame_idx`: world-camera frame index matched to the gaze sample
 - `frame_timestamp`: timestamp of the matched world-camera frame
-- `in_blink`, `blink id`: added only when `--blink-dir` is used
+- `in_blink`, `blink id`: added only when `--blink-dir` or `--blink-csv` is used
 - `gazed_object_id`: object/instance ID of the winning mask
 - `gazed_object`: object label of the winning mask
 - `gazed_object_confidence`: fraction of pixels inside the gaze-radius disk that overlap the winning object mask

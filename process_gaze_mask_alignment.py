@@ -624,6 +624,7 @@ class GazeObjectAligner:
         within_job_workers: int = 1,
         gaze_csv_path: Optional[str] = None,
         world_csv_path: Optional[str] = None,
+        blink_csv_path: Optional[str] = None,
         category_sort: str = "first_seen",
         gaze_confidence_threshold: float = 0.5,
         gaze_radius: int = 20,
@@ -662,6 +663,7 @@ class GazeObjectAligner:
         self.gaze_world_dir = gaze_world_dir
         self.gaze_csv_path = gaze_csv_path
         self.world_csv_path = world_csv_path
+        self.blink_csv_path = blink_csv_path
         self.mask_dir = mask_dir
         self.output_dir = output_dir
         self.blink_dir = blink_dir
@@ -1320,6 +1322,14 @@ class GazeObjectAligner:
             return Path(self.world_csv_path)
         return Path(self.gaze_world_dir) / f"{subj}_{camera}_world_timestamps.csv"
 
+    def _blink_csv_path(self, subj: str, camera: str) -> Optional[Path]:
+        """Blink CSV: --blink-csv if given, else --blink-dir naming convention, else None (no blink handling)."""
+        if self.blink_csv_path:
+            return Path(self.blink_csv_path)
+        if self.blink_dir:
+            return Path(self.blink_dir) / f"{subj}_{camera}_blinks.csv"
+        return None
+
     def _assign_best_objects(self, gaze_df: pd.DataFrame, probabilities: dict) -> list:
         """Fill gazed_object_id / gazed_object / gazed_object_confidence from per-mask scores.
 
@@ -1448,7 +1458,7 @@ class GazeObjectAligner:
 
     def label_blinks(self, aligned_gaze_df: pd.DataFrame, subj: str, camera: str) -> pd.DataFrame:
         """Label each gaze point with blink information, whether they are in blink periods."""
-        blink_df = pd.read_csv(os.path.join(self.blink_dir, f"{subj}_{camera}_blinks.csv"))
+        blink_df = pd.read_csv(self._blink_csv_path(subj, camera))
         blink_df = blink_df.sort_values("start timestamp [ns]")
         blink_starts = blink_df['start timestamp [ns]'].to_numpy()
         blink_ends   = blink_df['end timestamp [ns]'].to_numpy()
@@ -1517,7 +1527,7 @@ class GazeObjectAligner:
             unique_aligned_frames = int(gaze["frame_idx"].nunique())
             cut_world_frames = len(world_cam_dic)
 
-            if self.blink_dir is None:
+            if self._blink_csv_path(subject_id_temp, camera_temp) is None:
                 gaze_blink_removed = gaze
             else:
                 gaze_blink_labeled = self.label_blinks(gaze, subject_id_temp, camera_temp)
@@ -1627,7 +1637,7 @@ class GazeObjectAligner:
                 "Number of frames with gaze data before blink removal: %d",
                 unique_aligned_frames,
             )
-            if self.blink_dir is None:
+            if self._blink_csv_path(subject_id_temp, camera_temp) is None:
                 self.logger.info(
                     "Number of frames with gaze data after blink removal: %d (blink removal not applied)",
                     unique_post_blink_frames,
@@ -1687,6 +1697,7 @@ class GazeObjectAligner:
                 # The world CSV decides which frame each gaze sample is scored against.
                 "world_csv": str(self._world_csv_path(subject_id_temp, camera_temp).resolve()),
                 "blink_dir": str(Path(self.blink_dir).resolve()) if self.blink_dir else None,
+                **({"blink_csv": str(Path(self.blink_csv_path).resolve())} if self.blink_csv_path else {}),
                 # How gaze samples map to frames. Caches from before this key used "backward"
                 # matching (frame at or before the sample) and must not be reused.
                 "frame_match": "nearest_midpoint",
@@ -1880,6 +1891,7 @@ def process_subject_camera_pair(args):
         within_job_workers,
         gaze_csv_path,
         world_csv_path,
+        blink_csv_path,
         category_sort,
         gaze_confidence_threshold,
         gaze_radius,
@@ -1906,6 +1918,7 @@ def process_subject_camera_pair(args):
         within_job_workers=within_job_workers,
         gaze_csv_path=gaze_csv_path,
         world_csv_path=world_csv_path,
+        blink_csv_path=blink_csv_path,
         category_sort=category_sort,
         gaze_confidence_threshold=gaze_confidence_threshold,
         gaze_radius=gaze_radius,
@@ -1979,7 +1992,8 @@ def main():
         '  - SAM3 is auto-detected; no extra flag is needed.\n'
         '    Output gazed_object = "{concept}_{user_name}" for SAM3 instances.\n'
         '  - If --blink-dir is provided, blink CSVs must be named\n'
-        '    {subject}_{camera}_blinks.csv and include start timestamp [ns],\n'
+        '    {subject}_{camera}_blinks.csv; --blink-csv takes any file name instead.\n'
+        '    Either way the file must include start timestamp [ns],\n'
         '    end timestamp [ns], and blink id.\n'
         '  - Output folders are created as {output_dir}/{subject}/{camera}/.\n'
         '  - If --ignore-object-list is provided, ignored masks are excluded and\n'
@@ -2012,6 +2026,13 @@ def main():
              'Must be used together with --gaze-csv.',
     )
     parser.add_argument('--blink-dir', help='If remove gaze during blinks', required=False)
+    parser.add_argument(
+        '--blink-csv', dest='blink_csv', default=None,
+        help='Optional direct path to a single blinks CSV file, bypassing the '
+             '{subject}_{camera}_blinks.csv naming convention of --blink-dir. '
+             'Cannot be combined with --blink-dir; requires exactly one '
+             'subject/camera pair (via --subject-id/--camera-id).',
+    )
     parser.add_argument('--log-path', help='Path to the log file', required=False)
     parser.add_argument(
         '--ignore-object-list', default=None,
@@ -2164,6 +2185,10 @@ def main():
             "and one camera (--camera-id); auto-discovery from gaze_world_dir is "
             "not available when direct CSV paths are given."
         )
+    if args.blink_csv and args.blink_dir:
+        parser.error("--blink-csv and --blink-dir cannot be used together.")
+    if args.blink_csv and (not args.subject_id or ',' in args.subject_id or not args.camera_id or ',' in args.camera_id):
+        parser.error("--blink-csv requires exactly one subject (--subject-id) and one camera (--camera-id).")
     if args.gaze_world_dir is None and not args.gaze_csv:
         parser.error("gaze_world_dir is required unless --gaze-csv and --world-csv are both provided.")
 
@@ -2219,6 +2244,7 @@ def main():
         logger.info(f"Pipeline: {args.pipeline}")
         logger.info(f"Output Directory: {args.output_dir}")
         logger.info(f"Blink Directory: {args.blink_dir}")
+        logger.info(f"Blink CSV: {args.blink_csv}")
         logger.info(f"Ignore Object List: {args.ignore_object_list}")
         logger.info(f"Plot Start Time (s): {args.start_plot_time}")
         logger.info(f"Plot End Time (s): {args.end_plot_time}")
@@ -2244,8 +2270,8 @@ def main():
         )
         logger.info(f"Figure category grouping: {group_opts}")
         logger.info(f"Queue Logging: {use_queue_logging}")
-        if args.blink_dir is None:
-            logger.info("No blink directory provided, skipping blink labeling.")
+        if args.blink_dir is None and args.blink_csv is None:
+            logger.info("No blink directory or file provided, skipping blink labeling.")
 
         if args.num_workers <= 1 or len(subject_camera_pairs) <= 1:
             for subj, cam in subject_camera_pairs:
@@ -2265,6 +2291,7 @@ def main():
                     within_job_workers=args.within_job_workers,
                     gaze_csv_path=args.gaze_csv,
                     world_csv_path=args.world_csv,
+                    blink_csv_path=args.blink_csv,
                     category_sort=args.category_sort,
                     gaze_confidence_threshold=args.gaze_confidence_threshold,
                     gaze_radius=args.gaze_radius,
@@ -2294,6 +2321,7 @@ def main():
                     args.within_job_workers,
                     args.gaze_csv,
                     args.world_csv,
+                    args.blink_csv,
                     args.category_sort,
                     args.gaze_confidence_threshold,
                     args.gaze_radius,
