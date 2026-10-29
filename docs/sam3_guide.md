@@ -262,7 +262,7 @@ The reverse direction (porting SAM2 results into a SAM3 project) is not yet supp
 - **0 detections for a prompt**: try a broader prompt ("person" instead of "head of a child"). Detection always scans the whole video, so this is not a frame-choice issue. 
 Or, you can manually create a new instance under the concept, and add a few annotation points or bounding boxes for it.
 - **CUDA version too old**: SAM3 requires CUDA 12.6+. Check with `nvidia-smi`.
-- **PyTorch too old**: `pip install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126`
+- **PyTorch too old**: `pip install torch==2.7.0 torchvision --index-url https://download.pytorch.org/whl/cu126`
 - **Checkpoint access not granted**: request access at https://huggingface.co/facebook/sam3 and wait for approval.
 - **Checkpoint not found**: ensure the `.pt` file is in `sam_models/sam3/checkpoints/`.
 - **Import error**: verify installation with `pip list | grep -i sam3`.
