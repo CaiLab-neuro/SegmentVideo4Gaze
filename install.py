@@ -123,14 +123,14 @@ def install_packages():
             print(f"Using PyTorch index: {index_url}")
             subprocess.run([
                 sys.executable, "-m", "pip", "install",
-                "torch>=2.5.1", "torchvision>=0.20.1", "torchaudio",
+                "torch>=2.5.1", "torchvision>=0.20.1",
                 "--index-url", index_url
             ], check=True, capture_output=True)
         else:
             # Install CPU-only PyTorch
             subprocess.run([
                 sys.executable, "-m", "pip", "install",
-                "torch>=2.5.1", "torchvision>=0.20.1", "torchaudio"
+                "torch>=2.5.1", "torchvision>=0.20.1"
             ], check=True, capture_output=True)
         print("OK: PyTorch installed")
     except subprocess.CalledProcessError as e:
@@ -741,7 +741,7 @@ def install_sam3(versions=None):
                     print("ERROR: SAM3 requires PyTorch 2.7+")
                     print(f"Current version: {torch_version}")
                     print("Please upgrade PyTorch:")
-                    print("  pip install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126")
+                    print("  pip install torch==2.7.0 torchvision --index-url https://download.pytorch.org/whl/cu126")
                     return False
 
                 if torch.cuda.is_available():
@@ -787,6 +787,9 @@ def install_sam3(versions=None):
         "regex",
         "iopath>=0.1.10",
         "timm>=1.0.17",
+        # Imported by SAM3 at import time (sam3_video_predictor, edt)
+        "psutil",
+        "triton; sys_platform == 'linux'",
     ]
     for dep in additional_deps:
         try:
